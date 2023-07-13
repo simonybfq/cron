@@ -5,8 +5,36 @@
 分	0-59	          – * / ,
 小时	0-23	          – * / ,
 日期	1-31              – * ? / , L W
-月份	1-12 或者 JAN-DEC  – * / ,
-星期	0-6 或者 SUN-SAT	  – * ? / , L #
+月份	1-12或JAN-DEC      – * / ,
+星期	0-6或SUN-SAT       – * ? / , L #
+
+表达式例子：
+0 * * * * ? 每1分钟触发一次
+0 0 * * * ? 每天每1小时触发一次
+0 0 10 * * ? 每天10点触发一次
+0 * 14 * * ? 在每天下午2点到下午2:59期间的每1分钟触发
+0 30 9 1 * ? 每月1号上午9点半
+0 15 10 15 * ? 每月15日上午10:15触发
+
+*/5 * * * * ? 每隔5秒执行一次
+0 */1 * * * ? 每隔1分钟执行一次
+0 0 5-15 * * ? 每天5-15点整点触发
+0 0/3 * * * ? 每三分钟触发一次
+0 0-5 14 * * ? 在每天下午2点到下午2:05期间的每1分钟触发
+0 0/5 14 * * ? 在每天下午2点到下午2:55期间的每5分钟触发
+0 0/5 14,18 * * ? 在每天下午2点到2:55期间和下午6点到6:55期间的每5分钟触发
+0 0/30 9-17 * * ? 朝九晚五工作时间内每半小时
+0 0 10,14,16 * * ? 每天上午10点，下午2点，4点
+
+0 0 12 ? * WED 表示每个星期三中午12点
+0 0 17 ? * TUE,THU,SAT 每周二、四、六下午五点
+0 10,30 14 ? 3 WED 每年三月的星期三的下午2:10和2:30触发
+0 15 10 ? * MON-FRI 周一至周五的上午10:15触发
+0 15 10 ? * 6L 每月的最后一个星期六上午10:15触发
+0 15 10 ? * 6#3 每月的第三个星期六上午10:15触发
+
+0 0 23 L * ? 每月最后一天23点执行一次
+0 15 10 L * ? 每月最后一日的上午10:15触发
 ```
 ## Install
 ```
@@ -14,34 +42,33 @@ go get github.com/simonybfq/cron
 ```
 ## Usage
 ```go
-	s := New()
-	id, err := s.AddJob("2/1 * 8-16 * * ?", func() {
-		log.Println("1执行了2/1 * 8-16 * * ?")
-	})
-	if err != nil {
-		panic(err)
-	}
-	log.Println("id=", id)
-	go func() {
-		time.Sleep(time.Second * 2)
-		id, err = s.AddJob("2/1 0,10,20,30,40,50 * ? 7 1-2", func() {
-			log.Println("执行了2/1 0,10,20,30,40,50 * ? 7 1-2")
-		})
-		if err != nil {
-			panic(err)
-		}
-		log.Println("id=", id)
-		s.Remove(1)
-		time.Sleep(time.Second * 2)
-		id, err = s.AddJob("* * 8-16 * * ?", func() {
-			log.Println("2执行了* * 8-16 * * ?")
-		})
-		if err != nil {
-			panic(err)
-		}
-		log.Println("id=", id)
-	}()
-	s.Start()
-	var ch chan struct{}
-	<-ch
+s := New()
+s.Start()
+id, err := s.AddJob("2/1 * 8-16 * * ?", func() {
+    log.Println("1执行了2/1 * 8-16 * * ?")
+})
+if err != nil {
+    panic(err)
+}
+log.Println("id=", id)
+time.Sleep(time.Second * 2)
+id, err = s.AddJob("2/1 0,10,20,30,40,50 * ? 7 1-2", func() {
+    log.Println("执行了2/1 0,10,20,30,40,50 * ? 7 1-2")
+})
+if err != nil {
+    panic(err)
+}
+log.Println("id=", id)
+s.Remove(1)
+time.Sleep(time.Second * 2)
+id, err = s.AddJob("* * 8-16 * * ?", func() {
+    log.Println("2执行了* * 8-16 * * ?")
+})
+if err != nil {
+    panic(err)
+}
+log.Println("id=", id)
+s.Start()
+var ch chan struct{}
+<-ch
 ```

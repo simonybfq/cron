@@ -32,15 +32,14 @@ import (
 //0 0 10,14,16 * * ? 每天上午10点，下午2点，4点
 //
 //0 0 12 ? * WED 表示每个星期三中午12点
-//0 0 17 ? * TUES,THUR,SAT 每周二、四、六下午五点
-//0 10,44 14 ? 3 WED 每年三月的星期三的下午2:10和2:44触发
+//0 0 17 ? * TUE,THU,SAT 每周二、四、六下午五点
+//0 10,30 14 ? 3 WED 每年三月的星期三的下午2:10和2:30触发
 //0 15 10 ? * MON-FRI 周一至周五的上午10:15触发
+//0 15 10 ? * 6L 每月的最后一个星期六上午10:15触发
+//0 15 10 ? * 6#3 每月的第三个星期六上午10:15触发
 //
 //0 0 23 L * ? 每月最后一天23点执行一次
 //0 15 10 L * ? 每月最后一日的上午10:15触发
-//0 15 10 ? * 6L 每月的最后一个星期六上午10:15触发
-//
-//0 15 10 ? * 6#3 每月的第三个星期五上午10:15触发
 
 const maxDeep = 10
 
@@ -149,14 +148,19 @@ func (t *trigger) next(now time.Time, deeps ...uint8) *time.Time {
 		nextYear++
 	}
 	//星期
-	if t.week.calculate != nil {
-		//计算星期和日
-		t.week.calculate(int(nextYear), int(nextMonth))
+	if t.week.calculate != nil || t.day.calculate != nil {
+		if t.week.calculate != nil {
+			//计算星期和日
+			t.week.calculate(int(nextYear), int(nextMonth))
+		} else {
+			//计算日
+			t.day.calculate(int(nextYear), int(nextMonth))
+		}
 		nextDay = t.day.start
 		//如果算出来的要小于当前日期
 		tempDate := time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(hour), int(min), int(sec), now.Nanosecond(), time.Local)
 		if tempDate.Before(now) {
-			return t.next(time.Date(int(nextYear), time.Month(nextMonth), int(day), 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
+			return t.next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
 		}
 	} else {
 		//如果不是当月，则星期和日从起始值开始计算
@@ -319,19 +323,19 @@ func (t *trigger) parserDayField(s string) (err error) {
 	t.day = new(field)
 	if s == "*" || s == "?" {
 		t.day = &field{isRange: true, start: 1, end: 31}
-	} else if index := strings.IndexByte(s, '-'); index > 0 {
+	} else if index := strings.IndexByte(s, '-'); index > -1 {
 		tempUnitArr := strings.Split(s, "-")
 		err = t.parserRangeField("day", tempUnitArr, s, t.day)
 		if err != nil {
 			return err
 		}
-	} else if index = strings.IndexByte(s, '/'); index > 0 {
+	} else if index = strings.IndexByte(s, '/'); index > -1 {
 		tempUnitArr := strings.Split(s, "/")
 		err = t.parserIncreaseField("day", tempUnitArr, s, t.day)
 		if err != nil {
 			return err
 		}
-	} else if index = strings.IndexByte(s, ','); index > 0 {
+	} else if index = strings.IndexByte(s, ','); index > -1 {
 		tempUnitArr := strings.Split(s, ",")
 		err = t.parserEnumField("day", tempUnitArr, s, t.day)
 		if err != nil {
@@ -348,7 +352,7 @@ func (t *trigger) parserDayField(s string) (err error) {
 			start := getLatestWorkDay(year, month, max).Day()
 			t.day = &field{isRange: true, start: uint(start), end: uint(start)}
 		}
-	} else if index = strings.IndexByte(s, 'W'); index > 0 {
+	} else if index = strings.IndexByte(s, 'W'); index > -1 {
 		//1W
 		day, _ := strconv.ParseUint(s[:index], 10, 8)
 		t.day.calculate = func(year, month int) {
@@ -370,19 +374,19 @@ func (t *trigger) parserMonField(s string) (err error) {
 	t.mon = new(field)
 	if s == "*" {
 		t.mon = &field{isRange: true, start: 1, end: 12}
-	} else if index := strings.IndexByte(s, '-'); index > 0 {
+	} else if index := strings.IndexByte(s, '-'); index > -1 {
 		tempUnitArr := strings.Split(s, "-")
 		err = t.parserRangeField("mon", tempUnitArr, s, t.mon)
 		if err != nil {
 			return err
 		}
-	} else if index = strings.IndexByte(s, '/'); index > 0 {
+	} else if index = strings.IndexByte(s, '/'); index > -1 {
 		tempUnitArr := strings.Split(s, "/")
 		err = t.parserIncreaseField("mon", tempUnitArr, s, t.mon)
 		if err != nil {
 			return err
 		}
-	} else if index = strings.IndexByte(s, ','); index > 0 {
+	} else if index = strings.IndexByte(s, ','); index > -1 {
 		tempUnitArr := strings.Split(s, ",")
 		err = t.parserEnumField("mon", tempUnitArr, s, t.mon)
 		if err != nil {
@@ -420,25 +424,25 @@ func (t *trigger) parserWeekField(s string) (err error) {
 		if arr[3] != "*" && arr[3] != "?" {
 			return errors.New("day field must be * or ? when the week is specific")
 		}
-		if index := strings.IndexByte(s, '-'); index > 0 {
+		if index := strings.IndexByte(s, '-'); index > -1 {
 			tempUnitArr := strings.Split(s, "-")
 			err = t.parserRangeField("week", tempUnitArr, s, t.week)
 			if err != nil {
 				return err
 			}
-		} else if index = strings.IndexByte(s, '/'); index > 0 {
+		} else if index = strings.IndexByte(s, '/'); index > -1 {
 			tempUnitArr := strings.Split(s, "/")
 			err = t.parserIncreaseField("week", tempUnitArr, s, t.week)
 			if err != nil {
 				return err
 			}
-		} else if index = strings.IndexByte(s, ','); index > 0 {
+		} else if index = strings.IndexByte(s, ','); index > -1 {
 			tempUnitArr := strings.Split(s, ",")
 			err = t.parserEnumField("week", tempUnitArr, s, t.week)
 			if err != nil {
 				return err
 			}
-		} else if index = strings.IndexByte(s, 'L'); index > 0 {
+		} else if index = strings.IndexByte(s, 'L'); index > -1 {
 			var weekNum int
 			//当月最后一个星期六
 			if s == "L" {
@@ -451,13 +455,14 @@ func (t *trigger) parserWeekField(s string) (err error) {
 				if start < 0 || start > 6 {
 					return errors.New(fmt.Sprintf("week:%s L of left should be in [0,6]", s))
 				}
+				weekNum = int(start)
 			}
 			t.week.calculate = func(year, month int) {
 				now := getMonthLatestWeek(year, month, weekNum)
 				t.week = &field{isRange: true, start: uint(now.Weekday()), end: uint(now.Weekday())}
 				t.day = &field{isRange: true, start: uint(now.Day()), end: uint(now.Day())}
 			}
-		} else if index = strings.IndexByte(s, '#'); index > 0 {
+		} else if index = strings.IndexByte(s, '#'); index > -1 {
 			// 0#2每月第2个星期0
 			weekDay, err := strconv.ParseUint(s[:index], 10, 8)
 			if err != nil {
@@ -470,7 +475,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 			if err != nil {
 				return errors.New(fmt.Sprintf("week:%s weekNum should be a positive integer", s))
 			}
-			if weekDay < 1 || weekDay > 4 {
+			if weekNum < 1 || weekNum > 4 {
 				return errors.New(fmt.Sprintf("week:%s weekNum should in [1,4]", s))
 			}
 			t.week.calculate = func(year, month int) {
@@ -485,7 +490,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 				//SUN-SAT
 				alias, ok := weekAlias[s]
 				if !ok {
-					return errors.New("month field should be [0,6] or SUN-SAT")
+					return errors.New("week field should be [0,6] or SUN-SAT")
 				}
 				start = alias
 			} else {
@@ -520,19 +525,19 @@ func (t *trigger) parse() (err error) {
 		}
 		if str == "*" {
 			*f = field{isRange: true, start: 0, end: 59}
-		} else if index := strings.IndexByte(str, '-'); index > 0 {
+		} else if index := strings.IndexByte(str, '-'); index > -1 {
 			tempUnitArr := strings.Split(str, "-")
 			err = t.parserRangeField(unit, tempUnitArr, str, f)
 			if err != nil {
 				return err
 			}
-		} else if index = strings.IndexByte(str, '/'); index > 0 {
+		} else if index = strings.IndexByte(str, '/'); index > -1 {
 			tempUnitArr := strings.Split(str, "/")
 			err = t.parserIncreaseField(unit, tempUnitArr, str, f)
 			if err != nil {
 				return err
 			}
-		} else if index = strings.IndexByte(str, ','); index > 0 {
+		} else if index = strings.IndexByte(str, ','); index > -1 {
 			tempUnitArr := strings.Split(str, ",")
 			err = t.parserEnumField(unit, tempUnitArr, str, f)
 			if err != nil {
