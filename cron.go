@@ -24,7 +24,6 @@ import (
 //*/5 * * * * ? 每隔5秒执行一次
 //0 */1 * * * ? 每隔1分钟执行一次
 //0 0 5-15 * * ? 每天5-15点整点触发
-//0 0/3 * * * ? 每三分钟触发一次
 //0 0-5 14 * * ? 在每天下午2点到下午2:05期间的每1分钟触发
 //0 0/5 14 * * ? 在每天下午2点到下午2:55期间的每5分钟触发
 //0 0/5 14,18 * * ? 在每天下午2点到2:55期间和下午6点到6:55期间的每5分钟触发
@@ -36,21 +35,30 @@ import (
 //0 10,30 14 ? 3 WED 每年三月的星期三的下午2:10和2:30触发
 //0 15 10 ? * MON-FRI 周一至周五的上午10:15触发
 //0 15 10 ? * 6L 每月的最后一个星期六上午10:15触发
-//0 15 10 ? * 6#3 每月的第三个星期六上午10:15触发
+//0 0 0 ? 5 0#2 5月的第二个星期天00:00:00触发
 //
 //0 0 23 L * ? 每月最后一天23点执行一次
-//0 15 10 L * ? 每月最后一日的上午10:15触发
+//0 15 10 LW * ? 每月最后一个工作日的上午10:15触发
+//0 15 10 1W * ? 每月1号之后最近一个工作日的上午10:15触发
 
-const maxDeep = 10
+const (
+	maxDeep   = 10
+	secField  = "sec"
+	minField  = "min"
+	hourField = "hour"
+	dayField  = "day"
+	monField  = "mon"
+	weekField = "week"
+)
 
 var (
 	ranges = map[string][]uint{
-		"sec":  {0, 59},
-		"min":  {0, 59},
-		"hour": {0, 23},
-		"day":  {1, 31},
-		"mon":  {1, 12},
-		"week": {0, 6},
+		secField:  {0, 59},
+		minField:  {0, 59},
+		hourField: {0, 23},
+		dayField:  {1, 31},
+		monField:  {1, 12},
+		weekField: {0, 6},
 	}
 	monsAlias = map[string]uint{
 		"JAN": 1,
@@ -96,6 +104,7 @@ type trigger struct {
 	week *field
 }
 type field struct {
+	name      string
 	isRange   bool
 	start     uint
 	end       uint
@@ -230,34 +239,56 @@ func (t *trigger) next(now time.Time, deeps ...uint8) *time.Time {
 	return &nextTime
 }
 
-func (t *trigger) parserRangeField(unit string, arr []string, str string, f *field) error {
-	tempRange := ranges[unit]
+func checkAlias(str, value string, f *field, num *uint64) error {
+	errInfo := ""
+	switch f.name {
+	case weekField:
+		if v, ok := weekAlias[value]; ok {
+			*num = uint64(v)
+		} else {
+			errInfo = "SUN-SAT"
+		}
+	case monField:
+		if v, ok := monsAlias[value]; ok {
+			*num = uint64(v)
+		} else {
+			errInfo = "JAN-DEC"
+		}
+	}
+	if len(errInfo) > 0 {
+		return errors.New(fmt.Sprintf(f.name+" %s value:%s is not a positive integer or %s", str, value, errInfo))
+	}
+	return nil
+}
+func (t *trigger) parserRangeField(str string, arr []string, f *field) error {
+	f.isRange = true
+	tempRange := ranges[f.name]
 	min := tempRange[0]
 	max := tempRange[1]
 	start0, err := strconv.ParseUint(arr[0], 10, 8)
-	if err != nil {
-		return errors.New(fmt.Sprintf(unit+" %s start:%s is not a positive integer", str, arr[0]))
+	if err != nil && checkAlias(str, arr[0], f, &start0) != nil {
+		return err
 	}
-	start := uint(start0)
-	if start < min || start > max {
-		return errors.New(fmt.Sprintf(unit+" range should be [%d,%d]", min, max))
+	f.start = uint(start0)
+	if f.start < min || f.start > max {
+		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
 	}
 	end0, err := strconv.ParseUint(arr[1], 10, 8)
-	if err != nil {
-		return errors.New(fmt.Sprintf(unit+" %s end:%s is not a positive integer", str, arr[1]))
+	if err != nil && checkAlias(str, arr[1], f, &end0) != nil {
+		return err
 	}
-	end := uint(end0)
-	if end < min || end > max {
-		return errors.New(fmt.Sprintf(unit+" range should be [%d,%d]", min, max))
+	f.end = uint(end0)
+	if f.end < min || f.end > max {
+		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
 	}
-	if start > end {
-		return errors.New(fmt.Sprintf(unit+" %s start:%d should not greater than end %d", str, start, end))
+	if f.start > f.end {
+		return errors.New(fmt.Sprintf(f.name+" %s start:%d should not be greater than end %d", str, f.start, f.end))
 	}
-	*f = field{isRange: true, start: start, end: end}
 	return nil
 }
-func (t *trigger) parserIncreaseField(unit string, arr []string, str string, f *field) error {
-	tempRange := ranges[unit]
+func (t *trigger) parserIncreaseField(str string, arr []string, f *field) error {
+	f.isRange = false
+	tempRange := ranges[f.name]
 	min := tempRange[0]
 	max := tempRange[1]
 	var (
@@ -268,32 +299,35 @@ func (t *trigger) parserIncreaseField(unit string, arr []string, str string, f *
 	if arr[0] != "*" {
 		start0, err := strconv.ParseUint(arr[0], 10, 8)
 		if err != nil {
-			return errors.New(fmt.Sprintf(unit+" %s start:%s is not a positive integer", str, arr[0]))
+			return errors.New(fmt.Sprintf(f.name+" %s start:%s is not a positive integer", str, arr[0]))
 		}
 		start = uint(start0)
 		if start < min || start > max {
-			return errors.New(fmt.Sprintf(unit+" range should be [%d,%d]", min, max))
+			return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
 		}
 	}
 	increment0, err := strconv.ParseUint(arr[1], 10, 8)
 	if err != nil {
-		return errors.New(fmt.Sprintf(unit+" %s increment:%s is not a positive integer", str, arr[1]))
+		return errors.New(fmt.Sprintf(f.name+" %s increment:%s is not a positive integer", str, arr[1]))
 	}
 	increment = uint(increment0)
 	if increment == 0 {
-		return errors.New(fmt.Sprintf(unit+" increment should > 0", min, max))
+		return errors.New(fmt.Sprintf(f.name+" increment should be > 0", min, max))
 	}
 	if increment < min || increment > max {
-		return errors.New(fmt.Sprintf(unit+" range should be [%d,%d]", min, max))
+		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
 	}
-	*f = field{isRange: false, start: start, end: end, increment: increment}
+	f.start = start
+	f.end = end
+	f.increment = increment
 	for i := start; i <= end; i += increment {
 		f.values = append(f.values, i)
 	}
 	return nil
 }
-func (t *trigger) parserEnumField(unit string, arr []string, str string, f *field) error {
-	tempRange := ranges[unit]
+func (t *trigger) parserEnumField(str string, arr []string, f *field) error {
+	f.isRange = false
+	tempRange := ranges[f.name]
 	min := tempRange[0]
 	max := tempRange[1]
 	var (
@@ -302,42 +336,44 @@ func (t *trigger) parserEnumField(unit string, arr []string, str string, f *fiel
 	)
 	for i := 0; i < len(arr); i++ {
 		temp, err := strconv.ParseUint(arr[i], 10, 8)
-		if err != nil {
-			return errors.New(fmt.Sprintf(unit+" %s enum %s should be positive integer ", str, arr[i]))
+		if err != nil && checkAlias(str, arr[i], f, &temp) != nil {
+			return err
 		}
 		tempNum = uint(temp)
 		if tempNum < min || tempNum > max {
-			return errors.New(fmt.Sprintf(unit+" range should be [%d,%d]", min, max))
+			return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
 		}
 		values = append(values, tempNum)
 	}
 	sort.Slice(values, func(i, j int) bool {
 		return values[i] < values[j]
 	})
-	*f = field{isRange: false, values: values}
+	f.values = values
 	return nil
 }
 
 // 日期	1-31	– * ? / , L W
 func (t *trigger) parserDayField(s string) (err error) {
-	t.day = new(field)
+	t.day = &field{name: dayField}
 	if s == "*" || s == "?" {
-		t.day = &field{isRange: true, start: 1, end: 31}
+		t.day.isRange = true
+		t.day.start = 1
+		t.day.end = 31
 	} else if index := strings.IndexByte(s, '-'); index > -1 {
 		tempUnitArr := strings.Split(s, "-")
-		err = t.parserRangeField("day", tempUnitArr, s, t.day)
+		err = t.parserRangeField(s, tempUnitArr, t.day)
 		if err != nil {
 			return err
 		}
 	} else if index = strings.IndexByte(s, '/'); index > -1 {
 		tempUnitArr := strings.Split(s, "/")
-		err = t.parserIncreaseField("day", tempUnitArr, s, t.day)
+		err = t.parserIncreaseField(s, tempUnitArr, t.day)
 		if err != nil {
 			return err
 		}
 	} else if index = strings.IndexByte(s, ','); index > -1 {
 		tempUnitArr := strings.Split(s, ",")
-		err = t.parserEnumField("day", tempUnitArr, s, t.day)
+		err = t.parserEnumField(s, tempUnitArr, t.day)
 		if err != nil {
 			return err
 		}
@@ -350,45 +386,53 @@ func (t *trigger) parserDayField(s string) (err error) {
 		t.day.calculate = func(year, month int) {
 			max := getYearMonthDays(year, month)
 			start := getLatestWorkDay(year, month, max).Day()
-			t.day = &field{isRange: true, start: uint(start), end: uint(start)}
+			t.day.isRange = true
+			t.day.start = uint(start)
+			t.day.end = uint(start)
 		}
 	} else if index = strings.IndexByte(s, 'W'); index > -1 {
 		//1W
 		day, _ := strconv.ParseUint(s[:index], 10, 8)
 		t.day.calculate = func(year, month int) {
 			start := getLatestWorkDay(year, month, int(day)).Day()
-			t.day = &field{isRange: true, start: uint(start), end: uint(start)}
+			t.day.isRange = true
+			t.day.start = uint(start)
+			t.day.end = uint(start)
 		}
 	} else {
 		day, _ := strconv.ParseUint(s, 10, 8)
 		if day < 1 || day > 31 {
 			return errors.New(fmt.Sprintf("day field %s should be in [1,31]", s))
 		}
-		t.day = &field{isRange: true, start: uint(day), end: uint(day)}
+		t.day.isRange = true
+		t.day.start = uint(day)
+		t.day.end = uint(day)
 	}
 	return nil
 }
 
 // 月份	1-12 或者 JAN-DEC	– * / ,
 func (t *trigger) parserMonField(s string) (err error) {
-	t.mon = new(field)
+	t.mon = &field{name: monField}
 	if s == "*" {
-		t.mon = &field{isRange: true, start: 1, end: 12}
+		t.mon.isRange = true
+		t.mon.start = 1
+		t.mon.end = 12
 	} else if index := strings.IndexByte(s, '-'); index > -1 {
 		tempUnitArr := strings.Split(s, "-")
-		err = t.parserRangeField("mon", tempUnitArr, s, t.mon)
+		err = t.parserRangeField(s, tempUnitArr, t.mon)
 		if err != nil {
 			return err
 		}
 	} else if index = strings.IndexByte(s, '/'); index > -1 {
 		tempUnitArr := strings.Split(s, "/")
-		err = t.parserIncreaseField("mon", tempUnitArr, s, t.mon)
+		err = t.parserIncreaseField(s, tempUnitArr, t.mon)
 		if err != nil {
 			return err
 		}
 	} else if index = strings.IndexByte(s, ','); index > -1 {
 		tempUnitArr := strings.Split(s, ",")
-		err = t.parserEnumField("mon", tempUnitArr, s, t.mon)
+		err = t.parserEnumField(s, tempUnitArr, t.mon)
 		if err != nil {
 			return err
 		}
@@ -399,7 +443,7 @@ func (t *trigger) parserMonField(s string) (err error) {
 			//JAN-DEC
 			alias, ok := monsAlias[s]
 			if !ok {
-				return errors.New("month field should be [1,12] or JAN-DEC")
+				return errors.New("month field should be in [1,12] or JAN-DEC")
 			}
 			start = alias
 		} else {
@@ -408,7 +452,9 @@ func (t *trigger) parserMonField(s string) (err error) {
 				return errors.New(fmt.Sprintf("month field %s should be in [1,12]", s))
 			}
 		}
-		t.mon = &field{isRange: true, start: start, end: start}
+		t.mon.isRange = true
+		t.mon.start = start
+		t.mon.end = start
 	}
 	return
 }
@@ -418,7 +464,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 	if s == "*" || s == "?" {
 		t.week = &field{isRange: true, start: 0, end: 6}
 	} else {
-		t.week = new(field)
+		t.week = &field{name: weekField}
 		//日必须为*或者?
 		arr := strings.Split(t.cron, " ")
 		if arr[3] != "*" && arr[3] != "?" {
@@ -426,19 +472,19 @@ func (t *trigger) parserWeekField(s string) (err error) {
 		}
 		if index := strings.IndexByte(s, '-'); index > -1 {
 			tempUnitArr := strings.Split(s, "-")
-			err = t.parserRangeField("week", tempUnitArr, s, t.week)
+			err = t.parserRangeField(s, tempUnitArr, t.week)
 			if err != nil {
 				return err
 			}
 		} else if index = strings.IndexByte(s, '/'); index > -1 {
 			tempUnitArr := strings.Split(s, "/")
-			err = t.parserIncreaseField("week", tempUnitArr, s, t.week)
+			err = t.parserIncreaseField(s, tempUnitArr, t.week)
 			if err != nil {
 				return err
 			}
 		} else if index = strings.IndexByte(s, ','); index > -1 {
 			tempUnitArr := strings.Split(s, ",")
-			err = t.parserEnumField("week", tempUnitArr, s, t.week)
+			err = t.parserEnumField(s, tempUnitArr, t.week)
 			if err != nil {
 				return err
 			}
@@ -459,8 +505,12 @@ func (t *trigger) parserWeekField(s string) (err error) {
 			}
 			t.week.calculate = func(year, month int) {
 				now := getMonthLatestWeek(year, month, weekNum)
-				t.week = &field{isRange: true, start: uint(now.Weekday()), end: uint(now.Weekday())}
-				t.day = &field{isRange: true, start: uint(now.Day()), end: uint(now.Day())}
+				t.week.isRange = true
+				t.week.start = uint(now.Weekday())
+				t.week.end = uint(now.Weekday())
+				t.day.isRange = true
+				t.day.start = uint(now.Day())
+				t.day.end = uint(now.Day())
 			}
 		} else if index = strings.IndexByte(s, '#'); index > -1 {
 			// 0#2每月第2个星期0
@@ -469,19 +519,23 @@ func (t *trigger) parserWeekField(s string) (err error) {
 				return errors.New(fmt.Sprintf("week:%s weekDay should be a positive integer", s))
 			}
 			if weekDay < 0 || weekDay > 6 {
-				return errors.New(fmt.Sprintf("week:%s weekDay should in [0,6]", s))
+				return errors.New(fmt.Sprintf("week:%s weekDay should be in [0,6]", s))
 			}
 			weekNum, err := strconv.ParseUint(s[index+1:], 10, 8)
 			if err != nil {
 				return errors.New(fmt.Sprintf("week:%s weekNum should be a positive integer", s))
 			}
 			if weekNum < 1 || weekNum > 4 {
-				return errors.New(fmt.Sprintf("week:%s weekNum should in [1,4]", s))
+				return errors.New(fmt.Sprintf("week:%s weekNum should be in [1,4]", s))
 			}
 			t.week.calculate = func(year, month int) {
 				now := getMonthWeekByWeekNumDay(year, month, uint(weekNum), uint(weekDay))
-				t.week = &field{isRange: true, start: uint(now.Weekday()), end: uint(now.Weekday())}
-				t.day = &field{isRange: true, start: uint(now.Day()), end: uint(now.Day())}
+				t.week.isRange = true
+				t.week.start = uint(now.Weekday())
+				t.week.end = uint(now.Weekday())
+				t.day.isRange = true
+				t.day.start = uint(now.Day())
+				t.day.end = uint(now.Day())
 			}
 		} else {
 			var start uint
@@ -499,7 +553,9 @@ func (t *trigger) parserWeekField(s string) (err error) {
 					return errors.New(fmt.Sprintf("week field %s should be in [0,6]", s))
 				}
 			}
-			t.week = &field{isRange: true, start: start, end: start}
+			t.week.isRange = true
+			t.week.start = start
+			t.week.end = start
 		}
 	}
 	return
@@ -518,28 +574,33 @@ func (t *trigger) parse() (err error) {
 		switch i {
 		case 0:
 			t.sec = f
+			f.name = secField
 		case 1:
 			t.min = f
+			f.name = minField
 		case 2:
 			t.hour = f
+			f.name = hourField
 		}
 		if str == "*" {
-			*f = field{isRange: true, start: 0, end: 59}
+			f.isRange = true
+			f.start = 0
+			f.end = ranges[f.name][1]
 		} else if index := strings.IndexByte(str, '-'); index > -1 {
 			tempUnitArr := strings.Split(str, "-")
-			err = t.parserRangeField(unit, tempUnitArr, str, f)
+			err = t.parserRangeField(str, tempUnitArr, f)
 			if err != nil {
 				return err
 			}
 		} else if index = strings.IndexByte(str, '/'); index > -1 {
 			tempUnitArr := strings.Split(str, "/")
-			err = t.parserIncreaseField(unit, tempUnitArr, str, f)
+			err = t.parserIncreaseField(str, tempUnitArr, f)
 			if err != nil {
 				return err
 			}
 		} else if index = strings.IndexByte(str, ','); index > -1 {
 			tempUnitArr := strings.Split(str, ",")
-			err = t.parserEnumField(unit, tempUnitArr, str, f)
+			err = t.parserEnumField(str, tempUnitArr, f)
 			if err != nil {
 				return err
 			}
@@ -551,7 +612,9 @@ func (t *trigger) parse() (err error) {
 			if start < 0 || start > 59 {
 				return errors.New(unit + " range should be [0,59]")
 			}
-			*f = field{isRange: true, start: uint(start), end: uint(start)}
+			f.isRange = true
+			f.start = uint(start)
+			f.end = uint(start)
 		}
 	}
 	//解析日
@@ -618,31 +681,18 @@ func getIncreaseDayNextValue(values []uint, year int, nextMonth uint, day uint, 
 }
 
 func getYearMonthDays(year int, month int) int {
-	day31 := map[int]struct{}{
-		1:  {},
-		3:  {},
-		5:  {},
-		7:  {},
-		8:  {},
-		10: {},
-		12: {},
-	}
-	if _, ok := day31[month]; ok {
+	switch month {
+	case 1, 3, 5, 7, 8, 10, 12:
 		return 31
-	}
-	day30 := map[int]struct{}{
-		4:  {},
-		6:  {},
-		9:  {},
-		11: {},
-	}
-	if _, ok := day30[month]; ok {
+	case 4, 6, 9, 11:
 		return 30
+	default:
+		if (year%4 == 0 && year%100 != 0) || year%400 == 0 {
+			return 29
+		} else {
+			return 28
+		}
 	}
-	if (year%4 == 0 && year%100 != 0) || year%400 == 0 {
-		return 29
-	}
-	return 28
 }
 func getLatestWorkDay(year int, month int, day int) time.Time {
 	t, _ := time.Parse("20060102", fmt.Sprintf("%d%d%d", year, month, day))
