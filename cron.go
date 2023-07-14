@@ -39,7 +39,7 @@ import (
 //
 //0 0 23 L * ? 每月最后一天23点执行一次
 //0 15 10 LW * ? 每月最后一个工作日的上午10:15触发
-//0 15 10 1W * ? 每月1号之后最近一个工作日的上午10:15触发
+//0 15 10 15W * ? 每月15号之前最近一个工作日的上午10:15触发
 
 const (
 	maxDeep   = 10
@@ -110,7 +110,7 @@ type field struct {
 	end       uint
 	increment uint
 	values    []uint
-	calculate func(year, month int)
+	calculate func(year, month int) bool
 }
 
 func newTrigger(cronExpression string) (t *trigger, err error) {
@@ -155,20 +155,20 @@ func (t *trigger) next(now time.Time, deeps ...uint8) *time.Time {
 	}
 	if !isFind {
 		nextYear++
+		return t.next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local), deep)
 	}
 	//星期
 	if t.week.calculate != nil || t.day.calculate != nil {
 		if t.week.calculate != nil {
 			//计算星期和日
-			t.week.calculate(int(nextYear), int(nextMonth))
+			isFind = t.week.calculate(int(nextYear), int(nextMonth))
 		} else {
 			//计算日
-			t.day.calculate(int(nextYear), int(nextMonth))
+			isFind = t.day.calculate(int(nextYear), int(nextMonth))
 		}
 		nextDay = t.day.start
 		//如果算出来的要小于当前日期
-		tempDate := time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(hour), int(min), int(sec), now.Nanosecond(), time.Local)
-		if tempDate.Before(now) {
+		if !isFind || time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(hour), int(min), int(sec), now.Nanosecond(), time.Local).Before(now) {
 			return t.next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
 		}
 	} else {
@@ -378,26 +378,35 @@ func (t *trigger) parserDayField(s string) (err error) {
 			return err
 		}
 	} else if s == "L" {
-		t.day.calculate = func(year, month int) {
+		t.day.calculate = func(year, month int) bool {
 			start := getYearMonthDays(year, month)
-			t.day = &field{isRange: true, start: uint(start), end: uint(start)}
+			t.day.isRange = true
+			t.day.start = uint(start)
+			t.day.end = uint(start)
+			return true
 		}
 	} else if s == "LW" {
-		t.day.calculate = func(year, month int) {
+		t.day.calculate = func(year, month int) bool {
 			max := getYearMonthDays(year, month)
 			start := getLatestWorkDay(year, month, max).Day()
 			t.day.isRange = true
 			t.day.start = uint(start)
 			t.day.end = uint(start)
+			return true
 		}
 	} else if index = strings.IndexByte(s, 'W'); index > -1 {
-		//1W
+		//15W
 		day, _ := strconv.ParseUint(s[:index], 10, 8)
-		t.day.calculate = func(year, month int) {
-			start := getLatestWorkDay(year, month, int(day)).Day()
+		t.day.calculate = func(year, month int) bool {
+			tempTime := getLatestWorkDay(year, month, int(day))
+			if tempTime == nil {
+				return false
+			}
+			start := tempTime.Day()
 			t.day.isRange = true
 			t.day.start = uint(start)
 			t.day.end = uint(start)
+			return true
 		}
 	} else {
 		day, _ := strconv.ParseUint(s, 10, 8)
@@ -503,7 +512,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 				}
 				weekNum = int(start)
 			}
-			t.week.calculate = func(year, month int) {
+			t.week.calculate = func(year, month int) bool {
 				now := getMonthLatestWeek(year, month, weekNum)
 				t.week.isRange = true
 				t.week.start = uint(now.Weekday())
@@ -511,6 +520,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 				t.day.isRange = true
 				t.day.start = uint(now.Day())
 				t.day.end = uint(now.Day())
+				return true
 			}
 		} else if index = strings.IndexByte(s, '#'); index > -1 {
 			// 0#2每月第2个星期0
@@ -528,14 +538,18 @@ func (t *trigger) parserWeekField(s string) (err error) {
 			if weekNum < 1 || weekNum > 4 {
 				return errors.New(fmt.Sprintf("week:%s weekNum should be in [1,4]", s))
 			}
-			t.week.calculate = func(year, month int) {
+			t.week.calculate = func(year, month int) bool {
 				now := getMonthWeekByWeekNumDay(year, month, uint(weekNum), uint(weekDay))
+				if now == nil {
+					return false
+				}
 				t.week.isRange = true
 				t.week.start = uint(now.Weekday())
 				t.week.end = uint(now.Weekday())
 				t.day.isRange = true
 				t.day.start = uint(now.Day())
 				t.day.end = uint(now.Day())
+				return true
 			}
 		} else {
 			var start uint
@@ -694,41 +708,44 @@ func getYearMonthDays(year int, month int) int {
 		}
 	}
 }
-func getLatestWorkDay(year int, month int, day int) time.Time {
-	t, _ := time.Parse("20060102", fmt.Sprintf("%d%d%d", year, month, day))
-	for wd := t.Weekday(); wd == 0 || wd == 6; t = t.AddDate(0, 0, -1) {
-		wd = t.Weekday()
+func getLatestWorkDay(year int, month int, day int) *time.Time {
+	t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
+	for wd := t.Weekday(); wd == 0 || wd == 6; wd = t.Weekday() {
+		t = t.AddDate(0, 0, -1)
 	}
-	return t
+	if int(t.Month()) != month {
+		return nil
+	}
+	return &t
 }
-func getMonthLatestWeek(year, month, weekNum int) time.Time {
+func getMonthLatestWeek(year, month, weekDay int) time.Time {
 	max := getYearMonthDays(year, month)
 	t := time.Date(year, time.Month(month), max, 0, 0, 0, 0, time.Local)
-	for wd := t.Weekday(); int(wd) != weekNum; wd = t.Weekday() {
+	for wd := t.Weekday(); int(wd) != weekDay; wd = t.Weekday() {
 		t = t.AddDate(0, 0, -1)
 	}
 	return t
 }
-func getMonthAfterLatestWeek(year, month, day, weekNum int) time.Time {
+func getMonthAfterLatestWeek(year, month, day, weekDay int) time.Time {
 	t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-	for wd := t.Weekday(); int(wd) != weekNum; wd = t.Weekday() {
+	for wd := t.Weekday(); int(wd) != weekDay; wd = t.Weekday() {
 		t = t.AddDate(0, 0, 1)
 	}
 	return t
 }
-func getMonthWeekByWeekNumDay(year int, month int, weekNum uint, weekDay uint) time.Time {
+func getMonthWeekByWeekNumDay(year int, month int, weekNum uint, weekDay uint) *time.Time {
 	t := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.Local)
 	var tempWeekNum uint = 0
 	for tempWeekDay := t.Weekday(); int(t.Month()) == month; tempWeekDay = t.Weekday() {
 		if uint(tempWeekDay) == weekDay {
 			tempWeekNum++
 			if tempWeekNum == weekNum {
-				return t
+				return &t
 			}
 		}
 		t = t.AddDate(0, 0, 1)
 	}
-	return t
+	return nil
 }
 
 type job struct {
