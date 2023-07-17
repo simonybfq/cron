@@ -581,20 +581,17 @@ func (t *trigger) parse() (err error) {
 		return errors.New("cronExpression's fields count is not 6")
 	}
 	//解析秒，分，时
-	units := []string{"sec", "min", "hour"}
+	units := []string{secField, minField, hourField}
 	for i, unit := range units {
 		str := arr[i]
-		f := new(field)
+		f := &field{name: unit}
 		switch i {
 		case 0:
 			t.sec = f
-			f.name = secField
 		case 1:
 			t.min = f
-			f.name = minField
 		case 2:
 			t.hour = f
-			f.name = hourField
 		}
 		if str == "*" {
 			f.isRange = true
@@ -786,20 +783,23 @@ func (j *job) run() {
 }
 
 type Scheduler struct {
-	timer       *time.Timer
-	jobMap      map[uint]*job
-	jobs        []*job
-	lock        sync.Mutex
-	stop        chan struct{}
-	id          uint
-	running     bool
-	reStartChan chan struct{}
-	wg          sync.WaitGroup
+	timer    *time.Timer
+	jobMap   map[uint]*job
+	jobs     []*job
+	lock     sync.Mutex
+	id       uint
+	running  bool
+	runState bool
+	stop     chan struct{}
+	jobChan  chan struct{}
+	wg       sync.WaitGroup
 }
 
 func New() (s *Scheduler) {
 	s = new(Scheduler)
 	s.jobMap = make(map[uint]*job, 0)
+	s.stop = make(chan struct{}, 1)
+	s.jobChan = make(chan struct{}, 1)
 	return
 }
 func (c *Scheduler) AddJob(cronExpression string, f func()) (id uint, err error) {
@@ -814,14 +814,24 @@ func (c *Scheduler) AddJob(cronExpression string, f func()) (id uint, err error)
 	c.jobs = append(c.jobs, j)
 	c.jobMap[j.id] = j
 	if c.running {
-		c.reStartChan <- struct{}{}
+		c.jobChan <- struct{}{}
 	}
 	return j.id, nil
 }
 func (c *Scheduler) Remove(id uint) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	_, ok := c.jobMap[id]
+	if !ok {
+		return
+	}
 	delete(c.jobMap, id)
+	if len(c.jobs) == 1 {
+		c.stop <- struct{}{}
+		c.runState = false
+		c.jobs = c.jobs[:0]
+		return
+	}
 	var i int
 	for i = 0; i < len(c.jobs); i++ {
 		if c.jobs[i].id == id {
@@ -834,10 +844,8 @@ func (c *Scheduler) Start() {
 	if c.running {
 		return
 	}
-	c.stop = make(chan struct{}, 0)
-	c.reStartChan = make(chan struct{}, 1)
-	go c.reStart()
 	c.running = true
+	go c.watchJobAdding()
 	if len(c.jobs) == 0 {
 		return
 	}
@@ -848,7 +856,7 @@ func (c *Scheduler) Stop() (ctx context.Context) {
 	defer c.lock.Unlock()
 	if c.running {
 		close(c.stop)
-		close(c.reStartChan)
+		close(c.jobChan)
 		c.running = false
 	}
 	var cancel context.CancelFunc
@@ -877,6 +885,9 @@ func (c *Scheduler) run() {
 	for {
 		now = time.Now()
 		c.sortJob(nextNextTime)
+		if len(c.jobs) == 0 {
+			return
+		}
 		nextTime = c.jobs[0].nextTime
 		nextNextTime = nextTime.Add(time.Second)
 		c.timer = time.NewTimer(nextTime.Sub(now))
@@ -897,14 +908,15 @@ func (c *Scheduler) run() {
 		}
 	}
 }
-func (c *Scheduler) reStart() {
-	for {
+func (c *Scheduler) watchJobAdding() {
+	for c.running {
 		select {
-		case <-c.reStartChan:
-			c.Stop()
-			c.Start()
-		case <-c.stop:
-			return
+		case <-c.jobChan:
+			if c.runState {
+				c.stop <- struct{}{}
+				c.runState = false
+			}
+			go c.run()
 		}
 	}
 }
