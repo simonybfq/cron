@@ -883,17 +883,17 @@ func (c *Scheduler) run() {
 	nextTime := &now
 	nextNextTime := *nextTime
 	for {
-		now = time.Now()
 		c.sortJob(nextNextTime)
 		if len(c.jobs) == 0 {
 			return
 		}
+		now = time.Now()
 		nextTime = c.jobs[0].nextTime
 		nextNextTime = nextTime.Add(time.Second)
 		c.timer = time.NewTimer(nextTime.Sub(now))
 		select {
 		case _ = <-c.timer.C:
-			for i, tempNextTime := 0, nextTime; tempNextTime.Equal(*nextTime) && i < len(c.jobs); {
+			for i, tempNextTime := 0, c.jobs[0].nextTime; tempNextTime.Equal(*nextTime) && i < len(c.jobs); {
 				c.runJob(c.jobs[i])
 				c.jobs[i].next(nextNextTime)
 				i++
