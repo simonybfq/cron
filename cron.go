@@ -42,7 +42,7 @@ import (
 //0 15 10 15W * ? 每月15号之前最近一个工作日的上午10:15触发
 
 const (
-	maxDeep   = 10
+	maxDepth  = 10
 	secField  = "sec"
 	minField  = "min"
 	hourField = "hour"
@@ -120,12 +120,12 @@ func newTrigger(cronExpression string) (t *trigger, err error) {
 	return
 }
 
-// calculate next time to run. returns zero time(time.Time{}) if recursion call deep more than maxDeep
-func (t *trigger) next(now time.Time, deeps ...uint8) *time.Time {
+// calculate next time to run. returns zero time(time.Time{}) if recursion call deep more than maxDepth
+func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 	var deep uint8
-	if len(deeps) > 0 {
-		deep = deeps[0]
-		if deep > maxDeep {
+	if len(depth) > 0 {
+		deep = depth[0]
+		if deep > maxDepth {
 			return &time.Time{}
 		}
 	}
