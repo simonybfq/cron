@@ -94,7 +94,7 @@ var (
 月份	1-12 或者 JAN-DEC	– * / ,
 星期	0-6 或者 SUN-SAT	– * ? / , L #
 */
-type trigger struct {
+type Trigger struct {
 	cron string
 	sec  *field
 	min  *field
@@ -113,21 +113,24 @@ type field struct {
 	calculate func(year, month int) bool
 }
 
-func newTrigger(cronExpression string) (t *trigger, err error) {
-	t = new(trigger)
+func NewTrigger(cronExpression string) (t *Trigger, err error) {
+	t = new(Trigger)
 	t.cron = cronExpression
 	err = t.parse()
 	return
 }
 
-// calculate next time to run. returns zero time(time.Time{}) if recursion call deep more than maxDepth
-func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
+// calculate Next time to run. returns zero time(time.Time{}) if recursion call deep more than maxDepth
+func (t *Trigger) Next(now time.Time, depth ...uint8) *time.Time {
 	var deep uint8
 	if len(depth) > 0 {
 		deep = depth[0]
 		if deep > maxDepth {
 			return &time.Time{}
 		}
+	}
+	if deep == 0 {
+		now = now.Add(time.Second)
 	}
 	deep++
 	year := uint(now.Year())
@@ -155,7 +158,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 	}
 	if !isFind {
 		nextYear++
-		return t.next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local), deep)
+		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local), deep)
 	}
 	//星期
 	if t.week.calculate != nil || t.day.calculate != nil {
@@ -169,7 +172,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 		nextDay = t.day.start
 		//如果算出来的要小于当前日期
 		if !isFind || time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(hour), int(min), int(sec), now.Nanosecond(), time.Local).Before(now) {
-			return t.next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
+			return t.Next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
 		}
 	} else {
 		//如果不是当月，则星期和日从起始值开始计算
@@ -187,7 +190,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 		if !isFind {
 			//下一个nextWeekDay
 			tempDate := getMonthAfterLatestWeek(int(nextYear), int(nextMonth), int(startDay), int(nextWeekDay))
-			return t.next(tempDate, deep)
+			return t.Next(tempDate, deep)
 		}
 		//日,找出和星期对应的日
 		if t.day.isRange {
@@ -207,7 +210,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 		nextHour, isFind = getIncreaseNextValue(t.hour.values, startHour)
 	}
 	if !isFind {
-		return t.next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), 0, 0, 0, time.Local).Add(24*time.Hour), deep)
+		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), 0, 0, 0, time.Local).Add(24*time.Hour), deep)
 	}
 	//分,如果不是当前小时,分从起始值算起
 	startMin := min
@@ -220,7 +223,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 		nextMin, isFind = getIncreaseNextValue(t.min.values, startMin)
 	}
 	if !isFind {
-		return t.next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), 0, 0, time.Local).Add(time.Hour), deep)
+		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), 0, 0, time.Local).Add(time.Hour), deep)
 	}
 	//秒,如果不是当前分钟,秒从起始值算起
 	startSec := sec
@@ -233,7 +236,7 @@ func (t *trigger) next(now time.Time, depth ...uint8) *time.Time {
 		nextSec, isFind = getIncreaseNextValue(t.sec.values, startSec)
 	}
 	if !isFind {
-		return t.next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), int(nextSec), 0, time.Local).Add(time.Minute), deep)
+		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), int(nextSec), 0, time.Local).Add(time.Minute), deep)
 	}
 	nextTime := time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), int(nextSec), 0, time.Local)
 	return &nextTime
@@ -260,7 +263,7 @@ func checkAlias(str, value string, f *field, num *uint64) error {
 	}
 	return nil
 }
-func (t *trigger) parserRangeField(str string, arr []string, f *field) error {
+func (t *Trigger) parserRangeField(str string, arr []string, f *field) error {
 	f.isRange = true
 	tempRange := ranges[f.name]
 	min := tempRange[0]
@@ -286,7 +289,7 @@ func (t *trigger) parserRangeField(str string, arr []string, f *field) error {
 	}
 	return nil
 }
-func (t *trigger) parserIncreaseField(str string, arr []string, f *field) error {
+func (t *Trigger) parserIncreaseField(str string, arr []string, f *field) error {
 	f.isRange = false
 	tempRange := ranges[f.name]
 	min := tempRange[0]
@@ -325,7 +328,7 @@ func (t *trigger) parserIncreaseField(str string, arr []string, f *field) error 
 	}
 	return nil
 }
-func (t *trigger) parserEnumField(str string, arr []string, f *field) error {
+func (t *Trigger) parserEnumField(str string, arr []string, f *field) error {
 	f.isRange = false
 	tempRange := ranges[f.name]
 	min := tempRange[0]
@@ -353,7 +356,7 @@ func (t *trigger) parserEnumField(str string, arr []string, f *field) error {
 }
 
 // 日期	1-31	– * ? / , L W
-func (t *trigger) parserDayField(s string) (err error) {
+func (t *Trigger) parserDayField(s string) (err error) {
 	t.day = &field{name: dayField}
 	if s == "*" || s == "?" {
 		t.day.isRange = true
@@ -421,7 +424,7 @@ func (t *trigger) parserDayField(s string) (err error) {
 }
 
 // 月份	1-12 或者 JAN-DEC	– * / ,
-func (t *trigger) parserMonField(s string) (err error) {
+func (t *Trigger) parserMonField(s string) (err error) {
 	t.mon = &field{name: monField}
 	if s == "*" {
 		t.mon.isRange = true
@@ -469,7 +472,7 @@ func (t *trigger) parserMonField(s string) (err error) {
 }
 
 // 星期	0-6 或者 SUN-SAT	– * ? / , L #
-func (t *trigger) parserWeekField(s string) (err error) {
+func (t *Trigger) parserWeekField(s string) (err error) {
 	if s == "*" || s == "?" {
 		t.week = &field{isRange: true, start: 0, end: 6}
 	} else {
@@ -575,7 +578,7 @@ func (t *trigger) parserWeekField(s string) (err error) {
 	return
 }
 
-func (t *trigger) parse() (err error) {
+func (t *Trigger) parse() (err error) {
 	arr := strings.Split(t.cron, " ")
 	if len(arr) != 6 {
 		return errors.New("cronExpression's fields count is not 6")
@@ -747,7 +750,7 @@ func getMonthWeekByWeekNumDay(year int, month int, weekNum uint, weekDay uint) *
 
 type job struct {
 	id       uint
-	t        *trigger
+	t        *Trigger
 	fun      func()
 	nextTime *time.Time
 	running  bool
@@ -755,19 +758,19 @@ type job struct {
 
 func newJob(cronExpression string, f func()) (j *job, err error) {
 	j = new(job)
-	j.t, err = newTrigger(cronExpression)
+	j.t, err = NewTrigger(cronExpression)
 	if err != nil {
 		return nil, err
 	}
 	j.fun = f
-	j.nextTime = j.t.next(time.Now())
+	j.nextTime = j.t.Next(time.Now().Add(-time.Second))
 	return
 }
 func (j *job) next(t time.Time) *time.Time {
 	if j.nextTime != nil && j.nextTime.After(t) {
 		return j.nextTime
 	}
-	j.nextTime = j.t.next(t)
+	j.nextTime = j.t.Next(t)
 	return j.nextTime
 }
 
@@ -783,23 +786,22 @@ func (j *job) run() {
 }
 
 type Scheduler struct {
-	timer    *time.Timer
-	jobMap   map[uint]*job
-	jobs     []*job
-	lock     sync.Mutex
-	id       uint
-	running  bool
-	runState bool
-	stop     chan struct{}
-	jobChan  chan struct{}
-	wg       sync.WaitGroup
+	timer   *time.Timer
+	jobs    []*job
+	lock    sync.Mutex
+	id      uint
+	running bool
+	stop    chan struct{}
+	add     chan *job
+	remove  chan uint
+	wg      sync.WaitGroup
 }
 
 func New() (s *Scheduler) {
 	s = new(Scheduler)
-	s.jobMap = make(map[uint]*job, 0)
 	s.stop = make(chan struct{}, 1)
-	s.jobChan = make(chan struct{}, 1)
+	s.add = make(chan *job, 1)
+	s.remove = make(chan uint, 1)
 	return
 }
 func (c *Scheduler) AddJob(cronExpression string, f func()) (id uint, err error) {
@@ -808,35 +810,37 @@ func (c *Scheduler) AddJob(cronExpression string, f func()) (id uint, err error)
 		return 0, err
 	}
 	c.lock.Lock()
-	defer c.lock.Unlock()
 	c.id++
+	c.lock.Unlock()
 	j.id = c.id
 	c.jobs = append(c.jobs, j)
-	c.jobMap[j.id] = j
 	if c.running {
-		c.jobChan <- struct{}{}
+		c.add <- j
 	}
 	return j.id, nil
 }
 func (c *Scheduler) Remove(id uint) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	_, ok := c.jobMap[id]
-	if !ok {
-		return
+	if c.running {
+		c.remove <- id
+	} else {
+		c.removeJob(id)
 	}
-	delete(c.jobMap, id)
-	if len(c.jobs) == 1 {
-		c.stop <- struct{}{}
-		c.runState = false
-		c.jobs = c.jobs[:0]
-		return
-	}
+}
+func (c *Scheduler) removeJob(id uint) {
 	var i int
+	var has bool
 	for i = 0; i < len(c.jobs); i++ {
 		if c.jobs[i].id == id {
+			has = true
 			break
 		}
+	}
+	if !has {
+		return
+	}
+	if len(c.jobs) == 1 {
+		c.jobs = c.jobs[0:0]
+		return
 	}
 	c.jobs = append(c.jobs[:i], c.jobs[i+1:]...)
 }
@@ -845,18 +849,15 @@ func (c *Scheduler) Start() {
 		return
 	}
 	c.running = true
-	go c.watchJobAdding()
-	if len(c.jobs) == 0 {
-		return
-	}
-	c.run()
+	go c.run()
 }
 func (c *Scheduler) Stop() (ctx context.Context) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if c.running {
 		close(c.stop)
-		close(c.jobChan)
+		close(c.add)
+		close(c.remove)
 		c.running = false
 	}
 	var cancel context.CancelFunc
@@ -868,34 +869,36 @@ func (c *Scheduler) Stop() (ctx context.Context) {
 	return
 }
 
-func (c *Scheduler) sortJob(now time.Time) {
+func (c *Scheduler) sortJob() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	sort.Slice(c.jobs, func(i, j int) bool {
-		nextTime0 := c.jobs[i].next(now)
-		nextTime1 := c.jobs[j].next(now)
+		nextTime0 := c.jobs[i].nextTime
+		nextTime1 := c.jobs[j].nextTime
 		return nextTime0.Before(*nextTime1)
 	})
 }
 
 func (c *Scheduler) run() {
-	now := time.Now()
-	nextTime := &now
-	nextNextTime := *nextTime
+	var nextTime *time.Time
+	now := time.Now().Add(-time.Second)
+	for _, j := range c.jobs {
+		j.next(now)
+	}
 	for {
-		c.sortJob(nextNextTime)
+		c.sortJob()
 		if len(c.jobs) == 0 {
-			return
+			c.timer = time.NewTimer(100000 * time.Hour)
+		} else {
+			now = time.Now()
+			nextTime = c.jobs[0].nextTime
+			c.timer = time.NewTimer(nextTime.Sub(now))
 		}
-		now = time.Now()
-		nextTime = c.jobs[0].nextTime
-		nextNextTime = nextTime.Add(time.Second)
-		c.timer = time.NewTimer(nextTime.Sub(now))
 		select {
 		case _ = <-c.timer.C:
 			for i, tempNextTime := 0, c.jobs[0].nextTime; tempNextTime.Equal(*nextTime) && i < len(c.jobs); {
 				c.runJob(c.jobs[i])
-				c.jobs[i].next(nextNextTime)
+				c.jobs[i].next(*nextTime)
 				i++
 				if i < len(c.jobs) {
 					tempNextTime = c.jobs[i].nextTime
@@ -905,18 +908,11 @@ func (c *Scheduler) run() {
 		case <-c.stop:
 			c.timer.Stop()
 			return
-		}
-	}
-}
-func (c *Scheduler) watchJobAdding() {
-	for c.running {
-		select {
-		case <-c.jobChan:
-			if c.runState {
-				c.stop <- struct{}{}
-				c.runState = false
-			}
-			go c.run()
+		case <-c.add:
+			c.timer.Stop()
+		case id := <-c.remove:
+			c.timer.Stop()
+			c.removeJob(id)
 		}
 	}
 }
