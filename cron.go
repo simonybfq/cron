@@ -1,925 +1,643 @@
+// Package cron 提供 6 字段（秒 分 时 日 月 周）的 cron 表达式解析与任务调度。
+//
+// 字段  允许值             允许的特殊字符
+// 秒    0-59               , - * /
+// 分    0-59               , - * /
+// 小时  0-23               , - * /
+// 日期  1-31               , - * ? / L W
+// 月份  1-12 或 JAN-DEC    , - * /
+// 星期  0-6 或 SUN-SAT     , - * ? / L #   （0 = 周日）
+//
+// 表达式例子：
+//
+//	0 * * * * ?            每1分钟触发一次
+//	0 0 10 * * ?           每天10点触发一次
+//	*/5 * * * * ?          每隔5秒执行一次
+//	0 0/30 9-17 * * ?      朝九晚五工作时间内每半小时
+//	0 15 10 ? * MON-FRI    周一至周五的上午10:15触发
+//	0 15 10 ? * 6L         每月的最后一个星期六上午10:15触发
+//	0 0 0 ? 5 0#2          5月的第二个星期天00:00:00触发
+//	0 0 23 L * ?           每月最后一天23点执行一次
+//	0 15 10 LW * ?         每月最后一个工作日的上午10:15触发
+//	0 15 10 15W * ?        离每月15号最近的工作日（不跨月）上午10:15触发
+//
+// 日期和星期不能同时指定具体值，其中一个必须为 * 或 ?。
 package cron
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"math/bits"
 	"runtime/debug"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-//表达式例子：
-//
-//0 * * * * ? 每1分钟触发一次
-//0 0 * * * ? 每天每1小时触发一次
-//0 0 10 * * ? 每天10点触发一次
-//0 * 14 * * ? 在每天下午2点到下午2:59期间的每1分钟触发
-//0 30 9 1 * ? 每月1号上午9点半
-//0 15 10 15 * ? 每月15日上午10:15触发
-//
-//*/5 * * * * ? 每隔5秒执行一次
-//0 */1 * * * ? 每隔1分钟执行一次
-//0 0 5-15 * * ? 每天5-15点整点触发
-//0 0-5 14 * * ? 在每天下午2点到下午2:05期间的每1分钟触发
-//0 0/5 14 * * ? 在每天下午2点到下午2:55期间的每5分钟触发
-//0 0/5 14,18 * * ? 在每天下午2点到2:55期间和下午6点到6:55期间的每5分钟触发
-//0 0/30 9-17 * * ? 朝九晚五工作时间内每半小时
-//0 0 10,14,16 * * ? 每天上午10点，下午2点，4点
-//
-//0 0 12 ? * WED 表示每个星期三中午12点
-//0 0 17 ? * TUE,THU,SAT 每周二、四、六下午五点
-//0 10,30 14 ? 3 WED 每年三月的星期三的下午2:10和2:30触发
-//0 15 10 ? * MON-FRI 周一至周五的上午10:15触发
-//0 15 10 ? * 6L 每月的最后一个星期六上午10:15触发
-//0 0 0 ? 5 0#2 5月的第二个星期天00:00:00触发
-//
-//0 0 23 L * ? 每月最后一天23点执行一次
-//0 15 10 LW * ? 每月最后一个工作日的上午10:15触发
-//0 15 10 15W * ? 每月15号之前最近一个工作日的上午10:15触发
+// maxSearchYears 是 Next 向后搜索的最大年数，超过则认为没有下一次触发时间。
+const maxSearchYears = 50
 
-const (
-	maxDepth  = 10
-	secField  = "sec"
-	minField  = "min"
-	hourField = "hour"
-	dayField  = "day"
-	monField  = "mon"
-	weekField = "week"
-)
+// bitset 记录一个字段允许的取值，第 v 位为 1 表示允许 v。
+type bitset uint64
+
+func (b bitset) has(v int) bool {
+	return v >= 0 && v < 64 && b&(1<<uint(v)) != 0
+}
+
+// nextFrom 返回 >= v 的最小允许值。
+func (b bitset) nextFrom(v int) (int, bool) {
+	if v < 0 {
+		v = 0
+	}
+	if v >= 64 {
+		return 0, false
+	}
+	m := uint64(b) >> uint(v) << uint(v)
+	if m == 0 {
+		return 0, false
+	}
+	return bits.TrailingZeros64(m), true
+}
+
+func fullBits(lo, hi int) bitset {
+	var b bitset
+	for v := lo; v <= hi; v++ {
+		b |= 1 << uint(v)
+	}
+	return b
+}
+
+type fieldSpec struct {
+	name   string
+	lo, hi int
+	alias  map[string]int
+}
 
 var (
-	ranges = map[string][]uint{
-		secField:  {0, 59},
-		minField:  {0, 59},
-		hourField: {0, 23},
-		dayField:  {1, 31},
-		monField:  {1, 12},
-		weekField: {0, 6},
-	}
-	monsAlias = map[string]uint{
-		"JAN": 1,
-		"FEB": 2,
-		"MAR": 3,
-		"APR": 4,
-		"MAY": 5,
-		"JUN": 6,
-		"JUL": 7,
-		"AUG": 8,
-		"SEP": 9,
-		"OCT": 10,
-		"NOV": 11,
-		"DEC": 12,
-	}
-	weekAlias = map[string]uint{
-		"SUN": 0,
-		"MON": 1,
-		"TUE": 2,
-		"WED": 3,
-		"THU": 4,
-		"FRI": 5,
-		"SAT": 6,
-	}
+	secSpec  = fieldSpec{name: "second", lo: 0, hi: 59}
+	minSpec  = fieldSpec{name: "minute", lo: 0, hi: 59}
+	hourSpec = fieldSpec{name: "hour", lo: 0, hi: 23}
+	daySpec  = fieldSpec{name: "day", lo: 1, hi: 31}
+	monSpec  = fieldSpec{name: "month", lo: 1, hi: 12, alias: map[string]int{
+		"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+		"JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+	}}
+	weekSpec = fieldSpec{name: "week", lo: 0, hi: 6, alias: map[string]int{
+		"SUN": 0, "MON": 1, "TUE": 2, "WED": 3, "THU": 4, "FRI": 5, "SAT": 6,
+	}}
 )
 
-/*
-字段	允许值	允许的特殊字符
-秒	0-59	– * / ,
-分	0-59	– * / ,
-小时	0-23	– * / ,
-日期	1-31	– * ? / , L W
-月份	1-12 或者 JAN-DEC	– * / ,
-星期	0-6 或者 SUN-SAT	– * ? / , L #
-*/
+func (f fieldSpec) errorf(field, format string, args ...interface{}) error {
+	return fmt.Errorf("cron: %s field %q: %s", f.name, field, fmt.Sprintf(format, args...))
+}
+
+// value 解析单个取值（数字或别名）并校验范围。
+func (f fieldSpec) value(field, s string) (int, error) {
+	if n, err := strconv.Atoi(s); err == nil {
+		if n < f.lo || n > f.hi {
+			return 0, f.errorf(field, "value %d out of range [%d,%d]", n, f.lo, f.hi)
+		}
+		return n, nil
+	}
+	if v, ok := f.alias[strings.ToUpper(s)]; ok {
+		return v, nil
+	}
+	return 0, f.errorf(field, "invalid value %q", s)
+}
+
+// parse 解析由逗号分隔的列表，每一项可以是 *、a、a-b、*/n、a/n、a-b/n。
+func (f fieldSpec) parse(s string) (bitset, error) {
+	var b bitset
+	for _, part := range strings.Split(s, ",") {
+		rng, step := part, ""
+		if i := strings.IndexByte(part, '/'); i >= 0 {
+			rng, step = part[:i], part[i+1:]
+		}
+		var start, end int
+		switch {
+		case rng == "*":
+			start, end = f.lo, f.hi
+		case strings.Contains(rng, "-"):
+			ab := strings.Split(rng, "-")
+			if len(ab) != 2 {
+				return 0, f.errorf(s, "invalid range %q", rng)
+			}
+			var err error
+			if start, err = f.value(s, ab[0]); err != nil {
+				return 0, err
+			}
+			if end, err = f.value(s, ab[1]); err != nil {
+				return 0, err
+			}
+			if start > end {
+				return 0, f.errorf(s, "range start %d is greater than end %d", start, end)
+			}
+		default:
+			v, err := f.value(s, rng)
+			if err != nil {
+				return 0, err
+			}
+			start, end = v, v
+			if step != "" {
+				end = f.hi // a/n 表示从 a 开始到最大值，每 n 一次
+			}
+		}
+		inc := 1
+		if step != "" {
+			n, err := strconv.Atoi(step)
+			if err != nil || n < 1 {
+				return 0, f.errorf(s, "invalid step %q", step)
+			}
+			inc = n
+		}
+		for v := start; v <= end; v += inc {
+			b |= 1 << uint(v)
+		}
+	}
+	return b, nil
+}
+
+type dayKind uint8
+
+const (
+	dayBits           dayKind = iota // 普通取值集合
+	dayLast                          // L：当月最后一天
+	dayLastWorkday                   // LW：当月最后一个工作日
+	dayNearestWorkday                // nW：离 n 号最近的工作日（不跨月）
+)
+
+type weekKind uint8
+
+const (
+	weekBits weekKind = iota // 普通取值集合
+	weekLast                 // nL：当月最后一个星期 n
+	weekNth                  // n#k：当月第 k 个星期 n
+)
+
+// Trigger 是解析后的 cron 表达式。解析完成后不可变，可以被多个 goroutine 并发使用。
 type Trigger struct {
-	cron string
-	sec  *field
-	min  *field
-	hour *field
-	day  *field
-	mon  *field
-	week *field
-}
-type field struct {
-	name      string
-	isRange   bool
-	start     uint
-	end       uint
-	increment uint
-	values    []uint
-	calculate func(year, month int) bool
+	expr string
+
+	sec, min, hour, mon bitset
+
+	day     bitset
+	dayKind dayKind
+	dayN    int
+
+	week     bitset
+	weekKind weekKind
+	weekDay  int
+	weekN    int
 }
 
-func NewTrigger(cronExpression string) (t *Trigger, err error) {
-	t = new(Trigger)
-	t.cron = cronExpression
-	err = t.parse()
-	return
+// NewTrigger 解析 6 字段 cron 表达式。字段之间可以用任意数量的空白分隔。
+func NewTrigger(cronExpression string) (*Trigger, error) {
+	fs := strings.Fields(cronExpression)
+	if len(fs) != 6 {
+		return nil, fmt.Errorf("cron: expression %q must have 6 fields, got %d", cronExpression, len(fs))
+	}
+	t := &Trigger{expr: cronExpression}
+	var err error
+	if t.sec, err = secSpec.parse(fs[0]); err != nil {
+		return nil, err
+	}
+	if t.min, err = minSpec.parse(fs[1]); err != nil {
+		return nil, err
+	}
+	if t.hour, err = hourSpec.parse(fs[2]); err != nil {
+		return nil, err
+	}
+	if err = t.parseDay(fs[3]); err != nil {
+		return nil, err
+	}
+	if t.mon, err = monSpec.parse(fs[4]); err != nil {
+		return nil, err
+	}
+	if err = t.parseWeek(fs[5]); err != nil {
+		return nil, err
+	}
+	if !isAny(fs[3]) && !isAny(fs[5]) {
+		return nil, fmt.Errorf("cron: expression %q: day and week cannot both be specified, one of them must be * or ?", cronExpression)
+	}
+	if !t.possible() {
+		return nil, fmt.Errorf("cron: expression %q: day and month combination never occurs", cronExpression)
+	}
+	return t, nil
 }
 
-// calculate Next time to run. returns zero time(time.Time{}) if recursion call deep more than maxDepth
-func (t *Trigger) Next(now time.Time, depth ...uint8) *time.Time {
-	var deep uint8
-	if len(depth) > 0 {
-		deep = depth[0]
-		if deep > maxDepth {
-			return &time.Time{}
-		}
-	}
-	if deep == 0 {
-		now = now.Add(time.Second)
-	}
-	deep++
-	year := uint(now.Year())
-	month := uint(now.Month())
-	weekDay := uint(now.Weekday())
-	day := uint(now.Day())
-	hour := uint(now.Hour())
-	min := uint(now.Minute())
-	sec := uint(now.Second())
-	var (
-		nextYear    = uint(now.Year())
-		nextMonth   uint
-		nextWeekDay uint
-		nextDay     uint
-		nextHour    uint
-		nextMin     uint
-		nextSec     uint
-		isFind      bool
-	)
-	//月
-	if t.mon.isRange {
-		nextMonth, isFind = getRangeNextValue(t.mon.start, t.mon.end, month)
-	} else {
-		nextMonth, isFind = getIncreaseNextValue(t.mon.values, month)
-	}
-	if !isFind {
-		nextYear++
-		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local), deep)
-	}
-	//星期
-	if t.week.calculate != nil || t.day.calculate != nil {
-		if t.week.calculate != nil {
-			//计算星期和日
-			isFind = t.week.calculate(int(nextYear), int(nextMonth))
-		} else {
-			//计算日
-			isFind = t.day.calculate(int(nextYear), int(nextMonth))
-		}
-		nextDay = t.day.start
-		//如果算出来的要小于当前日期
-		if !isFind || time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(hour), int(min), int(sec), now.Nanosecond(), time.Local).Before(now) {
-			return t.Next(time.Date(int(nextYear), time.Month(nextMonth), 1, 0, 0, 0, 0, time.Local).AddDate(0, 1, 0), deep)
-		}
-	} else {
-		//如果不是当月，则星期和日从起始值开始计算
-		startWeekDay := weekDay
-		startDay := day
-		if !(nextYear == year && nextMonth == month) {
-			startWeekDay = 0
-			startDay = 1
-		}
-		if t.week.isRange {
-			nextWeekDay, isFind = getRangeNextValue(t.week.start, t.week.end, startWeekDay)
-		} else {
-			nextWeekDay, isFind = getIncreaseNextValue(t.week.values, startWeekDay)
-		}
-		if !isFind {
-			//下一个nextWeekDay
-			tempDate := getMonthAfterLatestWeek(int(nextYear), int(nextMonth), int(startDay), int(nextWeekDay))
-			return t.Next(tempDate, deep)
-		}
-		//日,找出和星期对应的日
-		if t.day.isRange {
-			nextDay = getRangeDayNextValue(t.day.start, t.day.end, nextYear, nextMonth, startDay, nextWeekDay)
-		} else {
-			nextDay = getIncreaseDayNextValue(t.day.values, int(nextYear), nextMonth, startDay, nextWeekDay)
-		}
-	}
-	//时,如果不是当前日,时从起始值算起
-	startHour := hour
-	if !(nextYear == year && nextMonth == month && nextDay == day) {
-		startHour = 0
-	}
-	if t.hour.isRange {
-		nextHour, isFind = getRangeNextValue(t.hour.start, t.hour.end, startHour)
-	} else {
-		nextHour, isFind = getIncreaseNextValue(t.hour.values, startHour)
-	}
-	if !isFind {
-		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), 0, 0, 0, time.Local).Add(24*time.Hour), deep)
-	}
-	//分,如果不是当前小时,分从起始值算起
-	startMin := min
-	if !(nextYear == year && nextMonth == month && nextDay == day && nextHour == hour) {
-		startMin = 0
-	}
-	if t.min.isRange {
-		nextMin, isFind = getRangeNextValue(t.min.start, t.min.end, startMin)
-	} else {
-		nextMin, isFind = getIncreaseNextValue(t.min.values, startMin)
-	}
-	if !isFind {
-		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), 0, 0, time.Local).Add(time.Hour), deep)
-	}
-	//秒,如果不是当前分钟,秒从起始值算起
-	startSec := sec
-	if !(nextYear == year && nextMonth == month && nextDay == day && nextHour == hour && nextMin == min) {
-		startSec = 0
-	}
-	if t.sec.isRange {
-		nextSec, isFind = getRangeNextValue(t.sec.start, t.sec.end, startSec)
-	} else {
-		nextSec, isFind = getIncreaseNextValue(t.sec.values, startSec)
-	}
-	if !isFind {
-		return t.Next(time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), int(nextSec), 0, time.Local).Add(time.Minute), deep)
-	}
-	nextTime := time.Date(int(nextYear), time.Month(nextMonth), int(nextDay), int(nextHour), int(nextMin), int(nextSec), 0, time.Local)
-	return &nextTime
-}
+// String 返回原始表达式。
+func (t *Trigger) String() string { return t.expr }
 
-func checkAlias(str, value string, f *field, num *uint64) error {
-	errInfo := ""
-	switch f.name {
-	case weekField:
-		if v, ok := weekAlias[value]; ok {
-			*num = uint64(v)
-		} else {
-			errInfo = "SUN-SAT"
-		}
-	case monField:
-		if v, ok := monsAlias[value]; ok {
-			*num = uint64(v)
-		} else {
-			errInfo = "JAN-DEC"
-		}
-	}
-	if len(errInfo) > 0 {
-		return errors.New(fmt.Sprintf(f.name+" %s value:%s is not a positive integer or %s", str, value, errInfo))
-	}
-	return nil
-}
-func (t *Trigger) parserRangeField(str string, arr []string, f *field) error {
-	f.isRange = true
-	tempRange := ranges[f.name]
-	min := tempRange[0]
-	max := tempRange[1]
-	start0, err := strconv.ParseUint(arr[0], 10, 8)
-	if err != nil && checkAlias(str, arr[0], f, &start0) != nil {
-		return err
-	}
-	f.start = uint(start0)
-	if f.start < min || f.start > max {
-		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
-	}
-	end0, err := strconv.ParseUint(arr[1], 10, 8)
-	if err != nil && checkAlias(str, arr[1], f, &end0) != nil {
-		return err
-	}
-	f.end = uint(end0)
-	if f.end < min || f.end > max {
-		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
-	}
-	if f.start > f.end {
-		return errors.New(fmt.Sprintf(f.name+" %s start:%d should not be greater than end %d", str, f.start, f.end))
-	}
-	return nil
-}
-func (t *Trigger) parserIncreaseField(str string, arr []string, f *field) error {
-	f.isRange = false
-	tempRange := ranges[f.name]
-	min := tempRange[0]
-	max := tempRange[1]
-	var (
-		start     = min
-		end       = max
-		increment uint
-	)
-	if arr[0] != "*" {
-		start0, err := strconv.ParseUint(arr[0], 10, 8)
-		if err != nil {
-			return errors.New(fmt.Sprintf(f.name+" %s start:%s is not a positive integer", str, arr[0]))
-		}
-		start = uint(start0)
-		if start < min || start > max {
-			return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
-		}
-	}
-	increment0, err := strconv.ParseUint(arr[1], 10, 8)
-	if err != nil {
-		return errors.New(fmt.Sprintf(f.name+" %s increment:%s is not a positive integer", str, arr[1]))
-	}
-	increment = uint(increment0)
-	if increment == 0 {
-		return errors.New(fmt.Sprintf(f.name+" increment should be > 0", min, max))
-	}
-	if increment < min || increment > max {
-		return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
-	}
-	f.start = start
-	f.end = end
-	f.increment = increment
-	for i := start; i <= end; i += increment {
-		f.values = append(f.values, i)
-	}
-	return nil
-}
-func (t *Trigger) parserEnumField(str string, arr []string, f *field) error {
-	f.isRange = false
-	tempRange := ranges[f.name]
-	min := tempRange[0]
-	max := tempRange[1]
-	var (
-		tempNum uint
-		values  []uint
-	)
-	for i := 0; i < len(arr); i++ {
-		temp, err := strconv.ParseUint(arr[i], 10, 8)
-		if err != nil && checkAlias(str, arr[i], f, &temp) != nil {
-			return err
-		}
-		tempNum = uint(temp)
-		if tempNum < min || tempNum > max {
-			return errors.New(fmt.Sprintf(f.name+" range should be in [%d,%d]", min, max))
-		}
-		values = append(values, tempNum)
-	}
-	sort.Slice(values, func(i, j int) bool {
-		return values[i] < values[j]
-	})
-	f.values = values
-	return nil
-}
+func isAny(s string) bool { return s == "*" || s == "?" }
 
-// 日期	1-31	– * ? / , L W
-func (t *Trigger) parserDayField(s string) (err error) {
-	t.day = &field{name: dayField}
-	if s == "*" || s == "?" {
-		t.day.isRange = true
-		t.day.start = 1
-		t.day.end = 31
-	} else if index := strings.IndexByte(s, '-'); index > -1 {
-		tempUnitArr := strings.Split(s, "-")
-		err = t.parserRangeField(s, tempUnitArr, t.day)
-		if err != nil {
-			return err
+func (t *Trigger) parseDay(s string) error {
+	switch {
+	case s == "?":
+		t.day = fullBits(1, 31)
+	case s == "L":
+		t.dayKind = dayLast
+	case s == "LW":
+		t.dayKind = dayLastWorkday
+	case strings.HasSuffix(s, "W"):
+		n, err := strconv.Atoi(s[:len(s)-1])
+		if err != nil || n < 1 || n > 31 {
+			return daySpec.errorf(s, "W must follow a day in [1,31]")
 		}
-	} else if index = strings.IndexByte(s, '/'); index > -1 {
-		tempUnitArr := strings.Split(s, "/")
-		err = t.parserIncreaseField(s, tempUnitArr, t.day)
-		if err != nil {
-			return err
-		}
-	} else if index = strings.IndexByte(s, ','); index > -1 {
-		tempUnitArr := strings.Split(s, ",")
-		err = t.parserEnumField(s, tempUnitArr, t.day)
-		if err != nil {
-			return err
-		}
-	} else if s == "L" {
-		t.day.calculate = func(year, month int) bool {
-			start := getYearMonthDays(year, month)
-			t.day.isRange = true
-			t.day.start = uint(start)
-			t.day.end = uint(start)
-			return true
-		}
-	} else if s == "LW" {
-		t.day.calculate = func(year, month int) bool {
-			max := getYearMonthDays(year, month)
-			start := getLatestWorkDay(year, month, max).Day()
-			t.day.isRange = true
-			t.day.start = uint(start)
-			t.day.end = uint(start)
-			return true
-		}
-	} else if index = strings.IndexByte(s, 'W'); index > -1 {
-		//15W
-		day, _ := strconv.ParseUint(s[:index], 10, 8)
-		t.day.calculate = func(year, month int) bool {
-			tempTime := getLatestWorkDay(year, month, int(day))
-			if tempTime == nil {
-				return false
-			}
-			start := tempTime.Day()
-			t.day.isRange = true
-			t.day.start = uint(start)
-			t.day.end = uint(start)
-			return true
-		}
-	} else {
-		day, _ := strconv.ParseUint(s, 10, 8)
-		if day < 1 || day > 31 {
-			return errors.New(fmt.Sprintf("day field %s should be in [1,31]", s))
-		}
-		t.day.isRange = true
-		t.day.start = uint(day)
-		t.day.end = uint(day)
-	}
-	return nil
-}
-
-// 月份	1-12 或者 JAN-DEC	– * / ,
-func (t *Trigger) parserMonField(s string) (err error) {
-	t.mon = &field{name: monField}
-	if s == "*" {
-		t.mon.isRange = true
-		t.mon.start = 1
-		t.mon.end = 12
-	} else if index := strings.IndexByte(s, '-'); index > -1 {
-		tempUnitArr := strings.Split(s, "-")
-		err = t.parserRangeField(s, tempUnitArr, t.mon)
-		if err != nil {
-			return err
-		}
-	} else if index = strings.IndexByte(s, '/'); index > -1 {
-		tempUnitArr := strings.Split(s, "/")
-		err = t.parserIncreaseField(s, tempUnitArr, t.mon)
-		if err != nil {
-			return err
-		}
-	} else if index = strings.IndexByte(s, ','); index > -1 {
-		tempUnitArr := strings.Split(s, ",")
-		err = t.parserEnumField(s, tempUnitArr, t.mon)
-		if err != nil {
-			return err
-		}
-	} else {
-		var start uint
-		mon, err := strconv.ParseUint(s, 10, 8)
-		if err != nil {
-			//JAN-DEC
-			alias, ok := monsAlias[s]
-			if !ok {
-				return errors.New("month field should be in [1,12] or JAN-DEC")
-			}
-			start = alias
-		} else {
-			start = uint(mon)
-			if start < 1 || start > 12 {
-				return errors.New(fmt.Sprintf("month field %s should be in [1,12]", s))
-			}
-		}
-		t.mon.isRange = true
-		t.mon.start = start
-		t.mon.end = start
-	}
-	return
-}
-
-// 星期	0-6 或者 SUN-SAT	– * ? / , L #
-func (t *Trigger) parserWeekField(s string) (err error) {
-	if s == "*" || s == "?" {
-		t.week = &field{isRange: true, start: 0, end: 6}
-	} else {
-		t.week = &field{name: weekField}
-		//日必须为*或者?
-		arr := strings.Split(t.cron, " ")
-		if arr[3] != "*" && arr[3] != "?" {
-			return errors.New("day field must be * or ? when the week is specific")
-		}
-		if index := strings.IndexByte(s, '-'); index > -1 {
-			tempUnitArr := strings.Split(s, "-")
-			err = t.parserRangeField(s, tempUnitArr, t.week)
-			if err != nil {
-				return err
-			}
-		} else if index = strings.IndexByte(s, '/'); index > -1 {
-			tempUnitArr := strings.Split(s, "/")
-			err = t.parserIncreaseField(s, tempUnitArr, t.week)
-			if err != nil {
-				return err
-			}
-		} else if index = strings.IndexByte(s, ','); index > -1 {
-			tempUnitArr := strings.Split(s, ",")
-			err = t.parserEnumField(s, tempUnitArr, t.week)
-			if err != nil {
-				return err
-			}
-		} else if index = strings.IndexByte(s, 'L'); index > -1 {
-			var weekNum int
-			//当月最后一个星期六
-			if s == "L" {
-				weekNum = 6
-			} else {
-				start, err := strconv.ParseUint(s[:index], 10, 8)
-				if err != nil {
-					return errors.New(fmt.Sprintf("week:%s L of left should be a positive integer", s))
-				}
-				if start < 0 || start > 6 {
-					return errors.New(fmt.Sprintf("week:%s L of left should be in [0,6]", s))
-				}
-				weekNum = int(start)
-			}
-			t.week.calculate = func(year, month int) bool {
-				now := getMonthLatestWeek(year, month, weekNum)
-				t.week.isRange = true
-				t.week.start = uint(now.Weekday())
-				t.week.end = uint(now.Weekday())
-				t.day.isRange = true
-				t.day.start = uint(now.Day())
-				t.day.end = uint(now.Day())
-				return true
-			}
-		} else if index = strings.IndexByte(s, '#'); index > -1 {
-			// 0#2每月第2个星期0
-			weekDay, err := strconv.ParseUint(s[:index], 10, 8)
-			if err != nil {
-				return errors.New(fmt.Sprintf("week:%s weekDay should be a positive integer", s))
-			}
-			if weekDay < 0 || weekDay > 6 {
-				return errors.New(fmt.Sprintf("week:%s weekDay should be in [0,6]", s))
-			}
-			weekNum, err := strconv.ParseUint(s[index+1:], 10, 8)
-			if err != nil {
-				return errors.New(fmt.Sprintf("week:%s weekNum should be a positive integer", s))
-			}
-			if weekNum < 1 || weekNum > 4 {
-				return errors.New(fmt.Sprintf("week:%s weekNum should be in [1,4]", s))
-			}
-			t.week.calculate = func(year, month int) bool {
-				now := getMonthWeekByWeekNumDay(year, month, uint(weekNum), uint(weekDay))
-				if now == nil {
-					return false
-				}
-				t.week.isRange = true
-				t.week.start = uint(now.Weekday())
-				t.week.end = uint(now.Weekday())
-				t.day.isRange = true
-				t.day.start = uint(now.Day())
-				t.day.end = uint(now.Day())
-				return true
-			}
-		} else {
-			var start uint
-			week, err := strconv.ParseUint(s, 10, 8)
-			if err != nil {
-				//SUN-SAT
-				alias, ok := weekAlias[s]
-				if !ok {
-					return errors.New("week field should be [0,6] or SUN-SAT")
-				}
-				start = alias
-			} else {
-				start = uint(week)
-				if start < 0 || start > 6 {
-					return errors.New(fmt.Sprintf("week field %s should be in [0,6]", s))
-				}
-			}
-			t.week.isRange = true
-			t.week.start = start
-			t.week.end = start
-		}
-	}
-	return
-}
-
-func (t *Trigger) parse() (err error) {
-	arr := strings.Split(t.cron, " ")
-	if len(arr) != 6 {
-		return errors.New("cronExpression's fields count is not 6")
-	}
-	//解析秒，分，时
-	units := []string{secField, minField, hourField}
-	for i, unit := range units {
-		str := arr[i]
-		f := &field{name: unit}
-		switch i {
-		case 0:
-			t.sec = f
-		case 1:
-			t.min = f
-		case 2:
-			t.hour = f
-		}
-		if str == "*" {
-			f.isRange = true
-			f.start = 0
-			f.end = ranges[f.name][1]
-		} else if index := strings.IndexByte(str, '-'); index > -1 {
-			tempUnitArr := strings.Split(str, "-")
-			err = t.parserRangeField(str, tempUnitArr, f)
-			if err != nil {
-				return err
-			}
-		} else if index = strings.IndexByte(str, '/'); index > -1 {
-			tempUnitArr := strings.Split(str, "/")
-			err = t.parserIncreaseField(str, tempUnitArr, f)
-			if err != nil {
-				return err
-			}
-		} else if index = strings.IndexByte(str, ','); index > -1 {
-			tempUnitArr := strings.Split(str, ",")
-			err = t.parserEnumField(str, tempUnitArr, f)
-			if err != nil {
-				return err
-			}
-		} else {
-			start, err := strconv.ParseUint(str, 10, 8)
-			if err != nil {
-				return errors.New(fmt.Sprintf(unit+" %s is not a positive integer", str))
-			}
-			if start < 0 || start > 59 {
-				return errors.New(unit + " range should be [0,59]")
-			}
-			f.isRange = true
-			f.start = uint(start)
-			f.end = uint(start)
-		}
-	}
-	//解析日
-	err = t.parserDayField(arr[3])
-	if err != nil {
-		return err
-	}
-	//解析月
-	err = t.parserMonField(arr[4])
-	if err != nil {
-		return err
-	}
-	//解析周
-	err = t.parserWeekField(arr[5])
-	if err != nil {
-		return err
-	}
-	return
-}
-
-func getRangeNextValue(start uint, end uint, nowValue uint) (nextValue uint, isFind bool) {
-	for i := start; i <= end; i++ {
-		if i >= nowValue {
-			nextValue = i
-			isFind = true
-			return
-		}
-	}
-	nextValue = start
-	return
-}
-func getIncreaseNextValue(values []uint, nowValue uint) (nextValue uint, isFind bool) {
-	for _, value := range values {
-		if value >= nowValue {
-			nextValue = value
-			isFind = true
-			return
-		}
-	}
-	nextValue = values[0]
-	return
-}
-func getRangeDayNextValue(start uint, end uint, year, nextMonth uint, day uint, nextWeekDay uint) uint {
-	for i := start; i <= end; i++ {
-		if i >= day {
-			tempDate := time.Date(int(year), time.Month(nextMonth), int(i), 0, 0, 0, 0, time.Local)
-			if uint(tempDate.Weekday()) == nextWeekDay {
-				return i
-			}
-		}
-	}
-	return 0
-}
-func getIncreaseDayNextValue(values []uint, year int, nextMonth uint, day uint, nextWeekDay uint) uint {
-	for _, i := range values {
-		if i >= day {
-			tempDate := time.Date(year, time.Month(nextMonth), int(i), 0, 0, 0, 0, time.Local)
-			if uint(tempDate.Weekday()) == nextWeekDay {
-				return i
-			}
-		}
-	}
-	return 0
-}
-
-func getYearMonthDays(year int, month int) int {
-	switch month {
-	case 1, 3, 5, 7, 8, 10, 12:
-		return 31
-	case 4, 6, 9, 11:
-		return 30
+		t.dayKind = dayNearestWorkday
+		t.dayN = n
 	default:
-		if (year%4 == 0 && year%100 != 0) || year%400 == 0 {
-			return 29
-		} else {
-			return 28
+		b, err := daySpec.parse(s)
+		if err != nil {
+			return err
 		}
-	}
-}
-func getLatestWorkDay(year int, month int, day int) *time.Time {
-	t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-	for wd := t.Weekday(); wd == 0 || wd == 6; wd = t.Weekday() {
-		t = t.AddDate(0, 0, -1)
-	}
-	if int(t.Month()) != month {
-		return nil
-	}
-	return &t
-}
-func getMonthLatestWeek(year, month, weekDay int) time.Time {
-	max := getYearMonthDays(year, month)
-	t := time.Date(year, time.Month(month), max, 0, 0, 0, 0, time.Local)
-	for wd := t.Weekday(); int(wd) != weekDay; wd = t.Weekday() {
-		t = t.AddDate(0, 0, -1)
-	}
-	return t
-}
-func getMonthAfterLatestWeek(year, month, day, weekDay int) time.Time {
-	t := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local)
-	for wd := t.Weekday(); int(wd) != weekDay; wd = t.Weekday() {
-		t = t.AddDate(0, 0, 1)
-	}
-	return t
-}
-func getMonthWeekByWeekNumDay(year int, month int, weekNum uint, weekDay uint) *time.Time {
-	t := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.Local)
-	var tempWeekNum uint = 0
-	for tempWeekDay := t.Weekday(); int(t.Month()) == month; tempWeekDay = t.Weekday() {
-		if uint(tempWeekDay) == weekDay {
-			tempWeekNum++
-			if tempWeekNum == weekNum {
-				return &t
-			}
-		}
-		t = t.AddDate(0, 0, 1)
+		t.day = b
 	}
 	return nil
+}
+
+func (t *Trigger) parseWeek(s string) error {
+	switch {
+	case s == "?":
+		t.week = fullBits(0, 6)
+	case s == "L":
+		t.weekKind = weekLast
+		t.weekDay = 6
+	case len(s) > 1 && strings.HasSuffix(s, "L"):
+		wd, err := weekSpec.value(s, s[:len(s)-1])
+		if err != nil {
+			return err
+		}
+		t.weekKind = weekLast
+		t.weekDay = wd
+	case strings.Contains(s, "#"):
+		parts := strings.Split(s, "#")
+		if len(parts) != 2 {
+			return weekSpec.errorf(s, "invalid # expression")
+		}
+		wd, err := weekSpec.value(s, parts[0])
+		if err != nil {
+			return err
+		}
+		n, err := strconv.Atoi(parts[1])
+		if err != nil || n < 1 || n > 5 {
+			return weekSpec.errorf(s, "number after # must be in [1,5]")
+		}
+		t.weekKind = weekNth
+		t.weekDay = wd
+		t.weekN = n
+	default:
+		b, err := weekSpec.parse(s)
+		if err != nil {
+			return err
+		}
+		t.week = b
+	}
+	return nil
+}
+
+// possible 检查日期和月份的组合是否可能出现，例如 2月30日 永远不会出现。
+func (t *Trigger) possible() bool {
+	for m := 1; m <= 12; m++ {
+		if !t.mon.has(m) {
+			continue
+		}
+		dim := daysIn(2000, m) // 2000 年是闰年，2 月取 29 天
+		switch t.dayKind {
+		case dayBits:
+			if t.day&fullBits(1, dim) != 0 {
+				return true
+			}
+		case dayNearestWorkday:
+			if t.dayN <= dim {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// Next 返回严格晚于 now 的下一次触发时间（精确到秒），使用 now 所在的时区。
+// 如果在 maxSearchYears 年内找不到，返回 false。
+func (t *Trigger) Next(now time.Time) (time.Time, bool) {
+	loc := now.Location()
+	start := now.Add(time.Second - time.Duration(now.Nanosecond()))
+	y, month, d := start.Date()
+	h, mi, s := start.Clock()
+	mo := int(month)
+	limit := y + maxSearchYears
+
+	for y <= limit {
+		m, ok := t.mon.nextFrom(mo)
+		if !ok {
+			y, mo, d, h, mi, s = y+1, 1, 1, 0, 0, 0
+			continue
+		}
+		if m != mo {
+			mo, d, h, mi, s = m, 1, 0, 0, 0
+		}
+		dd, ok := t.nextDay(y, mo, d)
+		if !ok {
+			mo, d, h, mi, s = mo+1, 1, 0, 0, 0
+			continue
+		}
+		if dd != d {
+			d, h, mi, s = dd, 0, 0, 0
+		}
+		hh, ok := t.hour.nextFrom(h)
+		if !ok {
+			d, h, mi, s = d+1, 0, 0, 0
+			continue
+		}
+		if hh != h {
+			h, mi, s = hh, 0, 0
+		}
+		mm, ok := t.min.nextFrom(mi)
+		if !ok {
+			h, mi, s = h+1, 0, 0
+			continue
+		}
+		if mm != mi {
+			mi, s = mm, 0
+		}
+		ss, ok := t.sec.nextFrom(s)
+		if !ok {
+			mi, s = mi+1, 0
+			continue
+		}
+		res := time.Date(y, time.Month(mo), d, h, mi, ss, 0, loc)
+		// 夏令时切换时，本地时间可能不存在或被规整到其他时刻，跳过这种结果
+		if res.Day() != d || res.Hour() != h || res.Minute() != mi || res.Second() != ss || !res.After(now) {
+			s = ss + 1
+			continue
+		}
+		return res, true
+	}
+	return time.Time{}, false
+}
+
+// nextDay 返回当月 >= d 的第一个满足日期和星期约束的日子。
+func (t *Trigger) nextDay(y, m, d int) (int, bool) {
+	dim := daysIn(y, m)
+	for ; d <= dim; d++ {
+		if t.matchDay(y, m, d, dim) && t.matchWeek(y, m, d, dim) {
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+func (t *Trigger) matchDay(y, m, d, dim int) bool {
+	switch t.dayKind {
+	case dayLast:
+		return d == dim
+	case dayLastWorkday:
+		return d == lastWorkday(y, m, dim)
+	case dayNearestWorkday:
+		return d == nearestWorkday(y, m, t.dayN, dim)
+	default:
+		return t.day.has(d)
+	}
+}
+
+func (t *Trigger) matchWeek(y, m, d, dim int) bool {
+	wd := weekday(y, m, d)
+	switch t.weekKind {
+	case weekLast:
+		return wd == t.weekDay && d+7 > dim
+	case weekNth:
+		return wd == t.weekDay && (d-1)/7+1 == t.weekN
+	default:
+		return t.week.has(wd)
+	}
+}
+
+func daysIn(y, m int) int {
+	return time.Date(y, time.Month(m)+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+func weekday(y, m, d int) int {
+	return int(time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC).Weekday())
+}
+
+func lastWorkday(y, m, dim int) int {
+	switch weekday(y, m, dim) {
+	case int(time.Saturday):
+		return dim - 1
+	case int(time.Sunday):
+		return dim - 2
+	}
+	return dim
+}
+
+// nearestWorkday 返回离 n 号最近的工作日，不跨月；n 超出当月天数时返回 0。
+func nearestWorkday(y, m, n, dim int) int {
+	if n > dim {
+		return 0
+	}
+	switch weekday(y, m, n) {
+	case int(time.Saturday):
+		if n == 1 {
+			return 3 // 1 号是周六，取周一 3 号
+		}
+		return n - 1
+	case int(time.Sunday):
+		if n == dim {
+			return n - 2 // 月末是周日，取周五
+		}
+		return n + 1
+	}
+	return n
 }
 
 type job struct {
-	id       uint
-	t        *Trigger
-	fun      func()
-	nextTime *time.Time
-	running  bool
+	id   uint
+	t    *Trigger
+	fn   func()
+	next time.Time
+	ok   bool // 是否还有下一次触发时间
+
+	skipIfRunning bool
+	running       atomic.Bool
 }
 
-func newJob(cronExpression string, f func()) (j *job, err error) {
-	j = new(job)
-	j.t, err = NewTrigger(cronExpression)
-	if err != nil {
-		return nil, err
-	}
-	j.fun = f
-	j.nextTime = j.t.Next(time.Now().Add(-time.Second))
-	return
-}
-func (j *job) next(t time.Time) *time.Time {
-	if j.nextTime != nil && j.nextTime.After(t) {
-		return j.nextTime
-	}
-	j.nextTime = j.t.Next(t)
-	return j.nextTime
+// JobOption 是 AddJob 的可选配置。
+type JobOption func(*job)
+
+// SkipIfStillRunning 表示到达触发时间时，如果该任务的上一次执行还没结束，就跳过本次触发。
+func SkipIfStillRunning() JobOption {
+	return func(j *job) { j.skipIfRunning = true }
 }
 
-func (j *job) run() {
-	j.running = true
-	defer func() {
-		j.running = false
-		if err := recover(); err != nil {
-			debug.PrintStack()
-		}
-	}()
-	j.fun()
+// runState 对应一次 Start 到 Stop 之间的运行周期。
+type runState struct {
+	stop chan struct{}
+	done chan struct{}
+	wg   sync.WaitGroup
 }
 
+// Scheduler 是任务调度器，所有方法都可以并发调用。
+// 任务在各自的 goroutine 中执行，默认情况下同一个任务的上一次执行未结束时，
+// 下一次仍会照常触发；需要跳过时使用 SkipIfStillRunning 选项。
 type Scheduler struct {
-	timer   *time.Timer
-	jobs    []*job
-	lock    sync.Mutex
-	id      uint
-	running bool
-	stop    chan struct{}
-	add     chan *job
-	remove  chan uint
-	wg      sync.WaitGroup
+	mu     sync.Mutex
+	jobs   []*job
+	nextID uint
+	wake   chan struct{}
+	state  *runState // nil 表示未运行
 }
 
-func New() (s *Scheduler) {
-	s = new(Scheduler)
-	s.stop = make(chan struct{}, 1)
-	s.add = make(chan *job, 1)
-	s.remove = make(chan uint, 1)
-	return
+func New() *Scheduler {
+	return &Scheduler{wake: make(chan struct{}, 1)}
 }
-func (c *Scheduler) AddJob(cronExpression string, f func()) (id uint, err error) {
-	j, err := newJob(cronExpression, f)
+
+// AddJob 添加任务并返回任务 ID，可以在调度器运行前或运行中调用。
+func (c *Scheduler) AddJob(cronExpression string, f func(), opts ...JobOption) (uint, error) {
+	if f == nil {
+		return 0, errors.New("cron: job func is nil")
+	}
+	t, err := NewTrigger(cronExpression)
 	if err != nil {
 		return 0, err
 	}
-	c.lock.Lock()
-	c.id++
-	c.lock.Unlock()
-	j.id = c.id
-	c.jobs = append(c.jobs, j)
-	if c.running {
-		c.add <- j
+	c.mu.Lock()
+	c.nextID++
+	j := &job{id: c.nextID, t: t, fn: f}
+	for _, opt := range opts {
+		opt(j)
 	}
+	j.next, j.ok = t.Next(time.Now())
+	c.jobs = append(c.jobs, j)
+	c.mu.Unlock()
+	c.notify()
 	return j.id, nil
 }
+
+// Remove 移除任务，已经在执行中的那一次不受影响。ID 不存在时什么也不做。
 func (c *Scheduler) Remove(id uint) {
-	if c.running {
-		c.remove <- id
-	} else {
-		c.removeJob(id)
-	}
-}
-func (c *Scheduler) removeJob(id uint) {
-	var i int
-	var has bool
-	for i = 0; i < len(c.jobs); i++ {
-		if c.jobs[i].id == id {
-			has = true
+	c.mu.Lock()
+	for i, j := range c.jobs {
+		if j.id == id {
+			copy(c.jobs[i:], c.jobs[i+1:])
+			c.jobs[len(c.jobs)-1] = nil
+			c.jobs = c.jobs[:len(c.jobs)-1]
 			break
 		}
 	}
-	if !has {
-		return
-	}
-	if len(c.jobs) == 1 {
-		c.jobs = c.jobs[0:0]
-		return
-	}
-	c.jobs = append(c.jobs[:i], c.jobs[i+1:]...)
+	c.mu.Unlock()
+	c.notify()
 }
+
+// Start 启动调度器；已在运行时什么也不做。Stop 之后可以再次 Start。
 func (c *Scheduler) Start() {
-	if c.running {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state != nil {
 		return
 	}
-	c.running = true
-	go c.run()
+	st := &runState{stop: make(chan struct{}), done: make(chan struct{})}
+	c.state = st
+	go c.run(st)
 }
-func (c *Scheduler) Stop() (ctx context.Context) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if c.running {
-		close(c.stop)
-		close(c.add)
-		close(c.remove)
-		c.running = false
+
+// Stop 停止调度器，不再触发新的任务。返回的 context 在调度循环退出、
+// 且本次运行期间启动的任务全部执行完毕后被取消。
+func (c *Scheduler) Stop() context.Context {
+	c.mu.Lock()
+	st := c.state
+	c.state = nil
+	if st != nil {
+		close(st.stop)
 	}
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithCancel(context.Background())
+	c.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if st == nil {
+		cancel()
+		return ctx
+	}
 	go func() {
-		c.wg.Wait()
+		<-st.done
+		st.wg.Wait()
 		cancel()
 	}()
-	return
+	return ctx
 }
 
-func (c *Scheduler) sortJob() {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	sort.Slice(c.jobs, func(i, j int) bool {
-		nextTime0 := c.jobs[i].nextTime
-		nextTime1 := c.jobs[j].nextTime
-		return nextTime0.Before(*nextTime1)
-	})
-}
-
-func (c *Scheduler) run() {
-	var nextTime *time.Time
-	now := time.Now().Add(-time.Second)
-	for _, j := range c.jobs {
-		j.next(now)
+func (c *Scheduler) notify() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
 	}
+}
+
+func (c *Scheduler) run(st *runState) {
+	defer close(st.done)
 	for {
-		c.sortJob()
-		if len(c.jobs) == 0 {
-			c.timer = time.NewTimer(100000 * time.Hour)
-		} else {
-			now = time.Now()
-			nextTime = c.jobs[0].nextTime
-			c.timer = time.NewTimer(nextTime.Sub(now))
-		}
+		c.mu.Lock()
 		select {
-		case _ = <-c.timer.C:
-			for i, tempNextTime := 0, c.jobs[0].nextTime; tempNextTime.Equal(*nextTime) && i < len(c.jobs); {
-				c.runJob(c.jobs[i])
-				c.jobs[i].next(*nextTime)
-				i++
-				if i < len(c.jobs) {
-					tempNextTime = c.jobs[i].nextTime
+		case <-st.stop:
+			c.mu.Unlock()
+			return
+		default:
+		}
+		now := time.Now()
+		var earliest time.Time
+		for _, j := range c.jobs {
+			if !j.ok {
+				continue
+			}
+			if !j.next.After(now) {
+				c.startJob(st, j)
+				// 从当前时间算下一次，错过的触发（例如系统休眠）不会补跑
+				if j.next, j.ok = j.t.Next(now); !j.ok {
+					continue
 				}
 			}
-			c.timer.Stop()
-		case <-c.stop:
-			c.timer.Stop()
-			return
-		case <-c.add:
-			c.timer.Stop()
-		case id := <-c.remove:
-			c.timer.Stop()
-			c.removeJob(id)
+			if earliest.IsZero() || j.next.Before(earliest) {
+				earliest = j.next
+			}
+		}
+		c.mu.Unlock()
+
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !earliest.IsZero() {
+			timer = time.NewTimer(time.Until(earliest))
+			timerC = timer.C
+		}
+		select {
+		case <-timerC:
+		case <-c.wake:
+		case <-st.stop:
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
 }
-func (c *Scheduler) runJob(j *job) {
-	c.wg.Add(1)
+
+// startJob 必须在持有 c.mu 时调用。
+func (c *Scheduler) startJob(st *runState, j *job) {
+	if j.skipIfRunning && !j.running.CompareAndSwap(false, true) {
+		return // 上一次还没结束，跳过本次触发
+	}
+	st.wg.Add(1)
 	go func() {
-		defer c.wg.Done()
-		j.run()
+		defer st.wg.Done()
+		defer func() {
+			if j.skipIfRunning {
+				j.running.Store(false)
+			}
+			if r := recover(); r != nil {
+				log.Printf("cron: job %d panic: %v\n%s", j.id, r, debug.Stack())
+			}
+		}()
+		j.fn()
 	}()
 }

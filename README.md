@@ -1,13 +1,24 @@
 ## Feature
+6 字段 cron 表达式（秒 分 时 日 月 周），字段之间用空白分隔。
 ```
 字段	允许值	          允许的特殊字符
-秒	0-59	          – * / ,
-分	0-59	          – * / ,
-小时	0-23	          – * / ,
-日期	1-31              – * ? / , L W
-月份	1-12或JAN-DEC      – * / ,
-星期	0-6或SUN-SAT       – * ? / , L #
+秒	0-59	          , - * /
+分	0-59	          , - * /
+小时	0-23	          , - * /
+日期	1-31              , - * ? / L W
+月份	1-12或JAN-DEC      , - * /
+星期	0-6或SUN-SAT       , - * ? / L #     (0 = 周日)
+```
+- 列表中的每一项可以是 `a`、`a-b`、`*/n`、`a/n`、`a-b/n`，例如 `1,3-5,20/2`。
+- 别名不区分大小写。
+- 日期和星期不能同时指定具体值，其中一个必须是 `*` 或 `?`。
+- `nW`：离 n 号最近的工作日，不跨月（如 1 号是周六则取 3 号周一）。
+- `L`/`nL`（星期）：当月最后一个星期 n，单独的 `L` 表示最后一个星期六。
+- `n#k`：当月第 k 个星期 n，k 取 1-5。
+- 永远不会出现的组合（如 `0 0 0 30 2 ?`）在解析时报错。
+- 时间按传入 `Next` 的时区计算；调度器使用本地时区。
 
+```
 表达式例子：
 0 * * * * ? 每1分钟触发一次
 0 0 * * * ? 每天每1小时触发一次
@@ -34,7 +45,7 @@
 
 0 0 23 L * ? 每月最后一天23点执行一次
 0 15 10 LW * ? 每月最后一个工作日的上午10:15触发
-0 15 10 15W * ? 每月15号之前最近一个工作日的上午10:15触发
+0 15 10 15W * ? 离每月15号最近的工作日（不跨月）上午10:15触发
 ```
 ## Install
 ```
@@ -42,32 +53,31 @@ go get github.com/simonybfq/cron
 ```
 ## Usage
 ```go
-s := New()
+s := cron.New()
+id, err := s.AddJob("0 */5 9-17 ? * MON-FRI", func() {
+    log.Println("工作日 9-17 点每 5 分钟执行")
+})
+if err != nil {
+    panic(err)
+}
 s.Start()
-id, err := s.AddJob("2/1 * 8-16 * * ?", func() {
-    log.Println("1执行了2/1 * 8-16 * * ?")
-})
+
+// ...
+
+// 上一次还没执行完时跳过本次触发（默认会并发执行）
+s.AddJob("*/10 * * * * ?", syncData, cron.SkipIfStillRunning())
+
+s.Remove(id)        // 移除任务
+ctx := s.Stop()     // 停止调度，不再触发新任务
+<-ctx.Done()        // 等待正在执行的任务结束
+s.Start()           // 可以再次启动
+```
+
+只计算触发时间：
+```go
+t, err := cron.NewTrigger("0 0 10 L * ?")
 if err != nil {
     panic(err)
 }
-log.Println("id=", id)
-time.Sleep(time.Second * 2)
-id, err = s.AddJob("2/1 0,10,20,30,40,50 * ? 7 1-2", func() {
-    log.Println("执行了2/1 0,10,20,30,40,50 * ? 7 1-2")
-})
-if err != nil {
-    panic(err)
-}
-log.Println("id=", id)
-s.Remove(1)
-time.Sleep(time.Second * 2)
-id, err = s.AddJob("* * 8-16 * * ?", func() {
-    log.Println("2执行了* * 8-16 * * ?")
-})
-if err != nil {
-    panic(err)
-}
-log.Println("id=", id)
-var ch chan struct{}
-<-ch
+next, ok := t.Next(time.Now()) // ok 为 false 表示 50 年内不会再触发
 ```
